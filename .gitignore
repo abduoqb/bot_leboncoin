@@ -1,0 +1,5 @@
+.env
+session.json
+cookies.json
+conversations.db
+__pycache__/

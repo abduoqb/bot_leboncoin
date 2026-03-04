@@ -1,0 +1,30 @@
+============================= test session starts =============================
+collecting ... collected 18 items
+
+tests/test_conversation.py::TestGetMessages::test_nouvelle_conversation PASSED [  5%]
+tests/test_conversation.py::TestGetMessages::test_conversation_existante PASSED [ 11%]
+tests/test_conversation.py::TestSaveMessage::test_save_user_message PASSED [ 16%]
+tests/test_conversation.py::TestSaveMessage::test_save_assistant_incremente_nb_envois PASSED [ 22%]
+tests/test_conversation.py::TestSaveMessage::test_multiple_assistant_messages PASSED [ 27%]
+tests/test_conversation.py::TestSaveMessage::test_caracteres_speciaux PASSED [ 33%]
+tests/test_conversation.py::TestGetNbEnvois::test_conversation_inexistante PASSED [ 38%]
+tests/test_conversation.py::TestGetNbEnvois::test_apres_envois PASSED    [ 44%]
+tests/test_conversation.py::TestBuildContext::test_contexte_vide PASSED  [ 50%]
+tests/test_conversation.py::TestBuildContext::test_contexte_avec_historique PASSED [ 55%]
+tests/test_conversation.py::TestBuildContext::test_max_history_limite PASSED [ 61%]
+tests/test_llm.py::TestGenerateReply::test_reponse_normale PASSED        [ 66%]
+tests/test_llm.py::TestGenerateReply::test_reponse_stripee PASSED        [ 72%]
+tests/test_llm.py::TestGenerateReply::test_timeout_retry PASSED          [ 77%]
+tests/test_llm.py::TestGenerateReply::test_3_timeouts_retourne_none PASSED [ 83%]
+tests/test_llm.py::TestGenerateReply::test_erreur_http_pas_de_retry PASSED [ 88%]
+tests/test_llm.py::TestGenerateReply::test_connection_error_retry PASSED [ 94%]
+tests/test_llm.py::TestGenerateReply::test_payload_correct PASSED        [100%]
+
+============================== warnings summary ===============================
+tests/test_conversation.py: 33 warnings
+  C:\Users\pikat\Documents\Codage\python\bot_lbc\conversation.py:60: DeprecationWarning: The default datetime adapter is deprecated as of Python 3.12; see the sqlite3 documentation for suggested replacement recipes
+    self.conn.execute(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 18 passed, 33 warnings in 0.21s =======================
+

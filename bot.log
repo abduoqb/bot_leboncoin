@@ -1,0 +1,16 @@
+23:39:12 [INFO] leboncoin — Navigateur Playwright démarré
+23:39:12 [INFO] leboncoin — Connexion à Leboncoin...
+23:39:53 [ERROR] leboncoin — Erreur login: Page.fill: Timeout 30000ms exceeded.
+Call log:
+  - waiting for locator("input[name=\"email\"]")
+
+23:45:07 [INFO] leboncoin — 23 cookies chargés depuis cookies.json
+23:45:07 [INFO] leboncoin — ✅ Session chargée depuis cookies.json — aucun login requis
+23:45:07 [INFO] leboncoin — Navigateur Playwright démarré
+23:45:07 [INFO] bot — 🚀 Bot démarré — scan toutes les 60s
+23:49:23 [INFO] bot — 📊 Stats: 0 traités, 0 erreurs, 5 scans
+23:50:50 [INFO] bot — 🛑 Arrêt demandé (Ctrl+C)...
+23:50:50 [INFO] bot — 🧹 Nettoyage en cours...
+23:50:50 [WARNING] leboncoin — Erreur fermeture navigateur: Browser.close: Connection closed while reading from the driver
+23:50:50 [INFO] conversation — Base SQLite fermée proprement
+23:50:50 [INFO] bot — 👋 Bot arrêté. Bilan: 0 messages traités, 0 erreurs, 6 scans
