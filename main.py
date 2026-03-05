@@ -166,6 +166,7 @@ async def main():
             had_messages = False
 
         # ── Système de repos (idle) ──
+        global idle_scans
         if had_messages:
             idle_scans = 0
         else:

@@ -4,5 +4,6 @@ cookies.json
 conversations.db
 __pycache__/
 debugs
+prompts.py
 
 bot.log

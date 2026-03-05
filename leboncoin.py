@@ -228,7 +228,6 @@ class LeboncoinClient:
             }""")
 
             if not urls_non_lues:
-                # Fallback : compter les conversations pour le log
                 total = await self.page.evaluate("""() => {
                     return document.querySelectorAll('a[href*="/messages/id/"]').length;
                 }""")
