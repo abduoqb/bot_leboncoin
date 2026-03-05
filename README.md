@@ -1,4 +1,4 @@
-# 🤖 Bot Leboncoin × Ollama
+# Bot Leboncoin × Ollama
 
 Bot Python qui répond automatiquement aux messages de tes annonces Leboncoin en utilisant un LLM local (Ollama / gemma3:4b). Zéro coût, tourne entièrement en local.
 
@@ -60,16 +60,15 @@ playwright install chromium
 ollama pull gemma3:4b
 ```
 
-### 4. Configurer le fichier `.env`
+### 4. Lancer Chrome en mode Débogage (Recommandé)
 
-Crée un fichier `.env` à la racine :
+Pour éviter la détection de bot par Leboncoin, il est fortement recommandé d'utiliser votre vrai navigateur Google Chrome.
 
-```env
-LBC_EMAIL=ton@email.com
-LBC_PASSWORD=ton_mot_de_passe
+Ouvrez un terminal PowerShell et lancez votre vrai Chrome avec ce port de débogage :
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\tmp\chrome_bot"
 ```
-
-> ⚠️ Ne commite **jamais** ce fichier. Il est déjà dans `.gitignore`.
+*(Connectez-vous à votre compte Leboncoin dans cette nouvelle fenêtre Chrome si ce n'est pas déjà fait).*
 
 --- 
 
@@ -77,16 +76,20 @@ LBC_PASSWORD=ton_mot_de_passe
 
 ### Lancer le bot
 
+Dans un autre terminal, lancez le bot :
 ```bash
 python main.py
 ```
 
 Le bot va :
-1. Démarrer Chromium (headless)
-2. Se connecter à Leboncoin (ou réutiliser la session `session.json`)
-3. Scanner les messages non lus toutes les 60 secondes
-4. Générer et envoyer une réponse via Ollama pour chaque nouveau message
-5. Sauvegarder le contexte en SQLite
+1. **[Mode CDP]** Si Chrome tourne sur le port `9222`, le bot s'y connecte et utilise votre vraie session (Zéro détection).
+2. **[Mode Chromium Fallback]** Sinon, il lance un navigateur caché.
+   - S'il n'est pas connecté, **une fenêtre s'affiche pour vous demander de vous connecter manuellement (glisser le CAPTCHA, email, mot de passe).**
+   - Une fois connecté, la session est sauvegardée (`session.json` ou `cookies.json`).
+3. Le bot commence à scanner la page `/messages` toutes les 60 secondes.
+4. Il détecte les bulles non-lues via le DOM (pas de sélecteurs CSS fragiles).
+5. Sauvegarde et répond via Ollama avec un vrai délai de frappe.
+6. Revient à l'accueil des messages pour le prochain scan.
 
 ### Arrêter le bot
 
@@ -94,7 +97,7 @@ Le bot va :
 Ctrl+C
 ```
 
-Le bot affiche un bilan final et ferme proprement toutes les ressources.
+Le bot arrête le scan en cours, affiche un bilan final (stats) et se déconnecte proprement.
 
 ---
 
