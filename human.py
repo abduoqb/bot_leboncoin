@@ -16,6 +16,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# ── Position souris (Bug 6) ───────────────────────────────────────────────────
+_last_mouse_pos: dict = {"x": 960, "y": 540}  # position initiale par défaut
+
 
 # ── Délais ────────────────────────────────────────────────────────────────────
 
@@ -77,11 +80,11 @@ async def human_move(page, x: float, y: float):
     Déplace la souris vers (x, y) en suivant une trajectoire courbe.
     Vitesse variable : accélération + décélération naturelle.
     """
+    global _last_mouse_pos
     try:
-        # Position actuelle (approximée au centre si inconnue)
-        vp = page.viewport_size or {"width": 1920, "height": 1080}
-        curr_x = random.uniform(200, vp["width"] - 200)
-        curr_y = random.uniform(150, vp["height"] - 150)
+        # Position actuelle : la dernière connue (Bug 6)
+        curr_x = _last_mouse_pos["x"]
+        curr_y = _last_mouse_pos["y"]
 
         # Petite variation sur la destination (on ne clique jamais exactement au pixel)
         dest_x = x + random.uniform(-3, 3)
@@ -98,6 +101,9 @@ async def human_move(page, x: float, y: float):
             await page.mouse.move(px, py)
             # Variation de vitesse : ralentir vers la fin
             await asyncio.sleep(step_delay * random.uniform(0.7, 1.3))
+
+        # Sauvegarder la position finale
+        _last_mouse_pos = {"x": dest_x, "y": dest_y}
 
     except Exception as e:
         logger.debug(f"human_move erreur (non bloquant): {e}")
@@ -125,28 +131,27 @@ async def human_click(page, element):
 
 # ── Clavier ───────────────────────────────────────────────────────────────────
 
-async def human_type(element, text: str):
+async def human_type(page, element, text: str):
     """
-    Tape le texte caractère par caractère avec des délais variables.
-    - Vitesse de base : 60-100 mots/min (frappe normale)
-    - Occasionnellement plus lent (hésitation)
-    - Petites pauses après les espaces et la ponctuation
+    Tape le texte caractère par caractère via page.keyboard (Weakness 4).
+    Utilise TYPING_SPEED_MIN/MAX depuis config (Bug 2).
     """
-    # Délai moyen par caractère en secondes (60 mots/min ≈ 5 chars/mot → ~200ms/char)
+    from config import TYPING_SPEED_MIN, TYPING_SPEED_MAX
+
+    # Cliquer sur l'élément pour le focus
+    await element.click()
+
     for i, char in enumerate(text):
-        await element.type(char, delay=0)  # on gère le délai manuellement
+        await page.keyboard.type(char, delay=0)  # on gère le délai manuellement
 
         if char == " ":
-            # Petite pause après un mot
-            delay = random.uniform(0.07, 0.18)
+            delay = random.uniform(TYPING_SPEED_MIN / 1000, TYPING_SPEED_MAX / 1000 * 1.5)
         elif char in ".,!?;:":
-            # Pause après ponctuation (on "réfléchit")
-            delay = random.uniform(0.15, 0.45)
+            delay = random.uniform(TYPING_SPEED_MAX / 1000, TYPING_SPEED_MAX / 1000 * 3.5)
         elif char.isupper():
-            # Majuscule = un poil plus lent (Shift)
-            delay = random.uniform(0.10, 0.22)
+            delay = random.uniform(TYPING_SPEED_MIN / 1000 * 1.5, TYPING_SPEED_MAX / 1000 * 1.8)
         else:
-            delay = random.uniform(0.05, 0.17)
+            delay = random.uniform(TYPING_SPEED_MIN / 1000, TYPING_SPEED_MAX / 1000)
 
         # Hésitation occasionnelle (1 fois sur 20 environ)
         if random.random() < 0.05:

@@ -185,8 +185,13 @@ class LeboncoinClient:
         self._shutdown = False
 
         try:
+            # 1. Aller sur l'accueil pour simuler un humain qui ne reste pas figé sur /messages
+            await self.page.goto("https://www.leboncoin.fr/")
+            await H.arrive_on_page(self.page)
+            
+            # 2. Aller sur la page de messages
             await self.page.goto("https://www.leboncoin.fr/messages")
-            await H.wait_page_load(self.page)
+            await H.arrive_on_page(self.page)
 
             # Vérifier connexion
             current_url = self.page.url
@@ -232,6 +237,9 @@ class LeboncoinClient:
 
             logger.info(f"📬 {len(urls_non_lues)} conversation(s) non lue(s)")
 
+            # Dédoublonnage (Bug 7)
+            urls_non_lues = list(dict.fromkeys(urls_non_lues))
+
             # ── Visiter chaque conversation non lue ──
             for url in urls_non_lues:
                 if self._shutdown:
@@ -245,7 +253,7 @@ class LeboncoinClient:
                     # Extraire le dernier message de L'ACHETEUR via JavaScript
                     # En mode conversation : PAS de sidebar, plein écran
                     # Messages acheteur = à gauche, nos messages = à droite (centrés)
-                    dernier = await self.page.evaluate("""() => {
+                    dernier = await self.page.evaluate(r"""() => {
                         const allElements = document.querySelectorAll('p, span, div');
                         const candidates = [];
                         const vpWidth = window.innerWidth;
@@ -277,26 +285,37 @@ class LeboncoinClient:
                             // Acheteur = aligné à gauche (centre < 40% du viewport)
                             // Vendeur = aligné à droite (centre > 60% du viewport)
                             const isBuyer = centerX < vpWidth * 0.4;
+                            const isSeller = centerX > vpWidth * 0.6;
                             
-                            if (isBuyer) {
+                            if (isBuyer || isSeller) {
                                 candidates.push({
                                     text: text,
-                                    top: rect.top
+                                    top: rect.top,
+                                    isLeft: isBuyer
                                 });
                             }
                         }
+
                         
                         if (candidates.length === 0) return null;
                         
-                        // Le plus bas = dernier message de l'acheteur
+                        // Trier par position verticale DESCENDANT (le plus bas = index 0)
                         candidates.sort((a, b) => b.top - a.top);
                         
+                        // Récupérer le bloc de messages final (jusqu'à ce qu'on croise un message du vendeur)
+                        const finalMessages = [];
                         for (const c of candidates) {
-                            if (c.text.length >= 2 && c.text.length <= 500) {
-                                return c.text;
+                            if (!c.isLeft) {
+                                // On a croisé un message du vendeur, on arrête de remonter
+                                break;
+                            }
+                            if (c.text.length >= 2 && c.text.length <= 1000) {
+                                finalMessages.unshift(c.text); // insérer au début pour remettre dans l'ordre chrono
                             }
                         }
-                        return candidates[0]?.text || null;
+                        
+                        if (finalMessages.length === 0) return null;
+                        return finalMessages.join("\n");
                     }""")
 
 
@@ -331,12 +350,16 @@ class LeboncoinClient:
 
         return conversations
 
-    async def send_message(self, id_conv: str, texte: str, conv_url: str = None) -> bool:
+    async def send_message(self, id_conv: str, texte: str, conv_url: str = None, buyer_text: str = None) -> bool:
         """Envoie un message dans une conversation."""
         try:
             target = conv_url if conv_url else f"https://www.leboncoin.fr/messages/id/{id_conv}"
             await self.page.goto(target)
             await H.arrive_on_page(self.page)
+
+            # Temps de réflexion humain proportionnel au message de l'ACHETEUR (Bug 3)
+            pause_text = buyer_text if buyer_text else texte
+            await H.reading_pause(pause_text, wpm=150)
 
             champ = await self.page.query_selector('textarea[placeholder]')
             if not champ:
@@ -347,7 +370,7 @@ class LeboncoinClient:
             await H.pause(0.3, 0.8)
 
             try:
-                await H.human_type(champ, texte)
+                await H.human_type(self.page, champ, texte)
             except Exception as e:
                 logger.warning(f"Erreur frappe humaine, fallback fill: {e}")
                 await champ.fill(texte)
@@ -365,10 +388,22 @@ class LeboncoinClient:
                 return False
 
             await H.human_click(self.page, btn)
-            await H.pause(1.0, 2.5)
-            logger.info(f"Message envoyé ✅ conv {id_conv}")
-            # Revenir à la liste des messages
-            await self.page.goto("https://www.leboncoin.fr/messages")
+            await H.pause(1.5, 3.0)
+
+            # Vérifier que le message a bien été envoyé (Weakness 2)
+            # On cherche le début du texte envoyé dans la page
+            snippet = texte[:40].replace('"', '\\"')
+            sent_ok = await self.page.evaluate(f'''() => {{
+                const all = document.body.innerText;
+                return all.includes("{snippet}");
+            }}''')
+            if not sent_ok:
+                logger.warning(f"\u26a0\ufe0f Conv {id_conv}: le message ne semble pas appara\u00eetre dans le chat apr\u00e8s envoi")
+
+            logger.info(f"Message envoy\u00e9 \u2705 conv {id_conv}")
+            
+            # Revenir \u00e0 l'accueil au lieu de la vue messages (Anti-bot)
+            await self.page.goto("https://www.leboncoin.fr/")
             return True
 
         except Exception as e:

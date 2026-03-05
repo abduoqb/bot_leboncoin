@@ -1,12 +1,15 @@
 import sqlite3
 import json
 import logging
+import asyncio
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
-class ConversationManager:
+class _SyncConversationManager:
+    """Gestionnaire synchrone SQLite (ne pas utiliser directement)."""
+
     def __init__(self, db_path="conversations.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._init_db()
@@ -24,7 +27,6 @@ class ConversationManager:
         self.conn.commit()
 
     def get_messages(self, id_lbc: str) -> tuple:
-        """Retourne (messages_list, nb_envois). Crée l'entrée si elle n'existe pas."""
         try:
             row = self.conn.execute(
                 "SELECT messages, nb_envois FROM conversations WHERE id_lbc=?", (id_lbc,)
@@ -41,7 +43,6 @@ class ConversationManager:
             return [], 0
 
     def get_nb_envois(self, id_lbc: str) -> int:
-        """Retourne le nombre de messages envoyés sans charger tout l'historique."""
         try:
             row = self.conn.execute(
                 "SELECT nb_envois FROM conversations WHERE id_lbc=?", (id_lbc,)
@@ -52,7 +53,6 @@ class ConversationManager:
             return 0
 
     def save_message(self, id_lbc: str, role: str, content: str):
-        """Ajoute un message à l'historique et incrémente nb_envois si role=assistant."""
         try:
             messages, nb = self.get_messages(id_lbc)
             messages.append({"role": role, "content": content})
@@ -67,7 +67,6 @@ class ConversationManager:
             logger.error(f"Erreur SQLite save_message({id_lbc}): {e}")
 
     def build_context(self, id_lbc: str, new_message: str, system_prompt: str, max_hist: int = 8) -> tuple:
-        """Construit le contexte [{role, content}] pour Ollama. Retourne (context, nb_envois)."""
         messages, nb_envois = self.get_messages(id_lbc)
         history = messages[-max_hist:]
         context = [{"role": "system", "content": system_prompt}]
@@ -76,9 +75,31 @@ class ConversationManager:
         return context, nb_envois
 
     def close(self):
-        """Ferme proprement la connexion SQLite."""
         try:
             self.conn.close()
             logger.info("Base SQLite fermée proprement")
         except sqlite3.Error as e:
             logger.error(f"Erreur fermeture SQLite: {e}")
+
+
+class ConversationManager:
+    """Wrapper async pour ne pas bloquer l'event loop (Weakness 1)."""
+
+    def __init__(self, db_path="conversations.db"):
+        self._sync = _SyncConversationManager(db_path)
+
+    async def get_messages(self, id_lbc: str) -> tuple:
+        return await asyncio.to_thread(self._sync.get_messages, id_lbc)
+
+    async def get_nb_envois(self, id_lbc: str) -> int:
+        return await asyncio.to_thread(self._sync.get_nb_envois, id_lbc)
+
+    async def save_message(self, id_lbc: str, role: str, content: str):
+        await asyncio.to_thread(self._sync.save_message, id_lbc, role, content)
+
+    async def build_context(self, id_lbc: str, new_message: str, system_prompt: str, max_hist: int = 8) -> tuple:
+        return await asyncio.to_thread(self._sync.build_context, id_lbc, new_message, system_prompt, max_hist)
+
+    async def close(self):
+        await asyncio.to_thread(self._sync.close)
+
