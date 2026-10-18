@@ -18,7 +18,7 @@ Bot Python qui répond automatiquement aux messages de tes annonces Leboncoin en
 - **Auto-relance du navigateur** — si Chrome crashe ou est fermé, le bot redémarre le profil et reprend
 - **Indépendant du répertoire courant** — profil, base et dumps sont toujours résolus depuis la racine du projet
 - **Aucun message perdu** — un envoi non confirmé est retenté au scan suivant
-- **Pause nocturne** — inactif entre 1h et 7h du matin (configurable)
+- **Pause nocturne** — inactif entre 1h et 6h du matin (configurable)
 - **Repos intelligent** — après 10 scans vides consécutifs, pause de 1h
 - **Contexte fidèle** — l'historique envoyé au modèle vient du **fil réellement lu dans la page**, pas de la base : les messages que tu as écrits à la main sont pris en compte, et aucune ancienne réponse fautive ne peut être réinjectée
 - **Contexte conversationnel** — SQLite async garde la trace et l'anti-doublon de chaque conversation
@@ -280,7 +280,7 @@ python -u tools/db_cleanup.py --ids a1b2,c3d4
 | **Intervalles aléatoires** | 75-180 s entre chaque scan (configurable) |
 | **Aucune relecture inutile** | Un fil n'est ouvert que si son aperçu change, s'il est non lu et jamais vu, ou si une réponse est en attente. Ouvrir un fil le marque « lu » : boucler dessus était le principal signal |
 | **Mémoire persistante** | `bot_state.json` : un redémarrage ne relit pas toutes les conversations |
-| **Pause nocturne** | Inactif entre 1h et 7h, aucune requête |
+| **Pause nocturne** | Inactif entre 1h et 6h, aucune requête |
 | **Repos intelligent** | Après 10 scans vides → pause 1h |
 | **Navigation dispersée** | Le bot passe par l'accueil avant chaque consultation de messages |
 | **Frappe clavier réaliste** | `page.keyboard.type()` caractère par caractère (40-120ms/touche), avec fautes de frappe corrigées (~4 %) |
