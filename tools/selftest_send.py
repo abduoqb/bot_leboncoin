@@ -86,6 +86,10 @@ def show(title, obj):
 
 
 async def main():
+    import instance
+    if instance.refuser_si_occupe("Ce test d'envoi (selftest_send)"):
+        return
+
     args = sys.argv[1:]
     confirm = "--confirm" in args
     conv_id = None

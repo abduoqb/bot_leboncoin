@@ -22,6 +22,7 @@ Principes (calibrés sur le DOM réel du site) :
 import os
 import sys
 import json
+import time
 import random
 import logging
 import asyncio
@@ -36,6 +37,8 @@ from config import (
     CHROME_CHANNEL,
     CDP_URL,
     CAPTCHA_WAIT_SECONDS,
+    RESTART_COOLDOWN_SECONDS,
+    MAX_RESTART_ESSAIS,
 )
 import human as H
 
@@ -50,6 +53,23 @@ _STATE_FILE = os.path.join(_BASE_DIR, "bot_state.json")
 # Nombre de tentatives (envoi raté / fil qui ne s'ouvre pas) avant d'abandonner
 # une conversation. Sans borne, un fil cassé serait rouvert à chaque scan.
 MAX_TENTATIVES = 3
+
+
+def _profil_occupe(erreur: BaseException) -> bool:
+    """Le lancement a-t-il échoué parce que le profil Chrome est DÉJÀ ouvert ?
+
+    Un profil Chrome ne peut être ouvert qu'une fois. Chrome ne refuse pas :
+    il ouvre une nouvelle fenêtre « about:blank » dans la session existante et
+    le processus lancé se termine aussitôt → Playwright perd la connexion.
+    Le message exact (« existing browser session » / sa traduction) n'apparaît
+    que dans les journaux du navigateur, inclus dans l'erreur Playwright.
+    """
+    s = str(erreur)
+    return (
+        "existing browser session" in s
+        or "session de navigateur existante" in s
+    )
+
 
 LBC_HOME = "https://www.leboncoin.fr/"
 LBC_MESSAGES = "https://www.leboncoin.fr/messages"
@@ -225,6 +245,12 @@ class LeboncoinClient:
         self._shutdown = False
         self._current_thread_url = None
 
+        # ── Antirebond de redémarrage ────────────────────────────────────────
+        # Si Chrome refuse de démarrer (profil déjà ouvert), chaque tentative
+        # ouvre une fenêtre « about:blank » de plus : on espace les essais.
+        self._echecs_redemarrage = 0
+        self._dernier_redemarrage = 0.0
+
         # ── État de veille ───────────────────────────────────────────────────
         # Le bot n'ouvre un fil QUE s'il a une raison de le faire : ouvrir un
         # fil le marque « lu » côté serveur et recharge la page. Boucler sur
@@ -233,7 +259,6 @@ class LeboncoinClient:
         self._pending = {}         # id_conv -> tentatives restantes (envoi raté)
         self._ignorees = set()     # id_conv où NOUS sommes l'acheteur
         self._settled = set()      # id_conv inspectés, plus rien à répondre
-        self._echecs = {}          # id_conv -> échecs d'inspection consécutifs
         self._load_state()
 
     # ── État persistant ──────────────────────────────────────────────────────
@@ -311,9 +336,27 @@ class LeboncoinClient:
         try:
             self.context = await self._pw.chromium.launch_persistent_context(**kwargs)
         except Exception as e:
+            if _profil_occupe(e):
+                # Le repli sur Chromium ne réglerait rien : le profil est en
+                # cause, pas le navigateur. Et il ouvrirait une fenêtre
+                # « about:blank » DE PLUS dans la session déjà ouverte.
+                logger.error(
+                    f"❌ Le profil Chrome {PROFILE_DIR} est déjà ouvert "
+                    f"(ton Chrome, ou une autre instance du bot). Ferme-le : "
+                    f"un profil ne peut être utilisé que par un seul Chrome."
+                )
+                raise
             logger.warning(f"Impossible de lancer « {CHROME_CHANNEL} » ({e}) → Chromium")
             kwargs.pop("channel", None)
-            self.context = await self._pw.chromium.launch_persistent_context(**kwargs)
+            try:
+                self.context = await self._pw.chromium.launch_persistent_context(**kwargs)
+            except Exception as e2:
+                if _profil_occupe(e2):
+                    logger.error(
+                        f"❌ Le profil Chrome {PROFILE_DIR} est déjà ouvert. "
+                        f"Ferme la fenêtre Chrome qui l'utilise avant de relancer."
+                    )
+                raise
 
         self.page = (
             self.context.pages[0] if self.context.pages
@@ -339,7 +382,23 @@ class LeboncoinClient:
         except Exception:
             pass
 
+        # Antirebond : si les redémarrages viennent d'échouer plusieurs fois
+        # d'affilée (profil Chrome déjà ouvert, navigateur récalcitrant), on
+        # n'essaie plus à chaque cycle. Chaque tentative rate en ouvrant une
+        # fenêtre « about:blank » supplémentaire : mieux vaut attendre.
+        if (self._echecs_redemarrage >= MAX_RESTART_ESSAIS
+                and time.monotonic() - self._dernier_redemarrage < RESTART_COOLDOWN_SECONDS):
+            reste = int(RESTART_COOLDOWN_SECONDS
+                        - (time.monotonic() - self._dernier_redemarrage))
+            logger.warning(
+                f"⏳ Navigateur indisponible ({self._echecs_redemarrage} échecs) → "
+                f"nouvelle tentative dans {reste}s. Vérifie qu'aucune autre "
+                f"fenêtre Chrome n'utilise « {PROFILE_DIR} »."
+            )
+            return False
+
         logger.warning("⚠️ Navigateur/page indisponible → redémarrage automatique.")
+        self._dernier_redemarrage = time.monotonic()
         try:
             await self.close()
         except Exception:
@@ -352,12 +411,19 @@ class LeboncoinClient:
         self._pending.clear()
         self._ignorees.clear()
         self._settled.clear()
-        self._echecs.clear()
         try:
             await self.start()
+            self._echecs_redemarrage = 0
             return True
         except Exception as e:
+            self._echecs_redemarrage += 1
             logger.error(f"❌ Redémarrage du navigateur impossible : {e}")
+            # start() peut échouer APRÈS avoir démarré Playwright : sans ce
+            # nettoyage, chaque cycle laisserait un process de plus derrière lui.
+            try:
+                await self.close()
+            except Exception:
+                pass
             return False
 
     # ── Détection captcha / connexion ─────────────────────────────────────────
@@ -549,10 +615,10 @@ class LeboncoinClient:
             preview = it["preview"]
 
             change = self._last_previews.get(href) != preview
-            self._last_previews[href] = preview   # vu, quel que soit le sort
 
             if id_conv in self._ignorees:
-                continue                          # on est l'acheteur ici
+                self._last_previews[href] = preview   # décision définitive
+                continue                              # on est l'acheteur ici
 
             if id_conv in self._pending:
                 if self._pending[id_conv] >= MAX_TENTATIVES:
@@ -562,6 +628,7 @@ class LeboncoinClient:
                     )
                     del self._pending[id_conv]
                     self._settled.add(id_conv)
+                    self._last_previews[href] = preview
                     continue
                 self._pending[id_conv] += 1
                 logger.debug(f"🔁 Conv {id_conv} : réponse en attente, nouvelle tentative")
@@ -572,6 +639,12 @@ class LeboncoinClient:
                 todo.append(it)
             else:
                 logger.debug(f"⏭️ Conv {id_conv} : rien de nouveau, fil non ouvert")
+                self._last_previews[href] = preview   # vu ET vérifié : rien à faire
+
+            # ⚠️ Pour les fils envoyés à l'inspection, l'aperçu n'est enregistré
+            # qu'APRÈS l'inspection (get_new_messages). Sinon, un fil coupé par
+            # la limite de scan serait marqué « vu » sans avoir été lu, et il ne
+            # serait plus jamais inspecté : un message d'acheteur se perdrait.
 
         self._trim_state()
         self._save_state()
@@ -636,16 +709,19 @@ class LeboncoinClient:
             inspected += 1
             thread = await self._read_thread(conv_url)
 
+            # Le fil a bien été ouvert : l'aperçu est désormais « vu ». S'il n'y
+            # a rien à répondre il ne sera plus rouvert ; s'il reste une réponse
+            # en attente, `_pending` s'en charge (retentatives bornées).
+            # ⚠️ Cet enregistrement ne doit PAS avoir lieu avant l'ouverture :
+            # un fil coupé par la limite de scan doit rester candidat au scan
+            # suivant, sinon le message qu'il contient est perdu.
+            self._last_previews[href] = it["preview"]
+
             if thread is None:
-                # Fil illisible (captcha, lien absent…). On retente, mais pas
-                # indéfiniment : au-delà il sera considéré comme réglé.
-                self._echecs[id_conv] = self._echecs.get(id_conv, 0) + 1
-                if self._echecs[id_conv] >= MAX_TENTATIVES:
-                    logger.warning(f"⚠️ Conv {id_conv} illisible {MAX_TENTATIVES}× "
-                                   f"→ ignorée désormais.")
-                    self._settled.add(id_conv)
+                # Fil illisible (captcha, lien absent…) : on retente au scan
+                # suivant — `_pending` borne le nombre d'essais.
+                self._pending.setdefault(id_conv, 0)
                 continue
-            self._echecs.pop(id_conv, None)
 
             # Conversation où NOUS sommes l'acheteur (« À propos de ce vendeur ») :
             # le bot ne doit jamais répondre à la place du vendeur d'une AUTRE

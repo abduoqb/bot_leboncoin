@@ -38,6 +38,7 @@ bot_lbc/
 ├── conversation.py    # ConversationManager async (SQLite via asyncio.to_thread)
 ├── llm.py             # Client Ollama async (classify + generate, session partagée)
 ├── leboncoin.py       # LeboncoinClient (Playwright, profil Chrome persistant)
+├── instance.py        # Verrou système : un seul programme par profil Chrome
 ├── captcha.py         # Glissement « humain » du slider DataDome
 ├── rules.py           # Règles déterministes AVANT le LLM (conclusion, injection,
 │                      #   disponibilité) + nettoyage des réponses générées
@@ -47,6 +48,7 @@ bot_lbc/
 │   ├── selftest_llm.py    # Boucle qualité : batterie de messages → catégorie + réponse
 │   ├── selftest_scan.py   # Vérifie qu'aucun fil déjà réglé n'est rouvert (0 navigateur)
 │   ├── selftest_context.py # Vérifie que le fil de la page fait foi (0 navigateur)
+│   ├── selftest_instance.py # Vérifie le verrou « un seul bot par profil » (0 navigateur)
 │   ├── db_cleanup.py      # Entretien de conversations.db (liste, puis purge sur --apply)
 │   ├── selftest_send.py   # Diagnostic/envoi réel contrôlé sur UNE conversation
 │   ├── explore.py         # Cartographie la liste des conversations
@@ -57,6 +59,7 @@ bot_lbc/
 ├── chrome_profile/    # Auto-généré — profil Chrome persistant (login conservé)
 ├── conversations.db   # Auto-généré — historique SQLite
 ├── bot_state.json     # Auto-généré — mémoire des aperçus déjà vus (anti-boucle)
+├── bot.lock           # Auto-généré — verrou « un seul bot à la fois »
 └── debugs/            # Auto-généré — captures/DOM d'un échec de chargement
 ```
 
@@ -207,9 +210,15 @@ n'ouvre donc un fil que s'il a une raison de le faire (`leboncoin.py` →
 | L'aperçu n'a jamais été vu (démarrage, nouvelle annonce) | ✅ oui, une fois |
 | Non lu et jamais inspecté depuis le démarrage | ✅ oui, une fois |
 | Réponse en attente (envoi raté) | ✅ oui, **max 3 tentatives** puis abandon |
+| Fil coupé par la limite de scan (6 fils/scan) | ✅ oui, **au scan suivant** |
 | Déjà inspecté, rien à répondre | ❌ non |
 | Nous sommes l'acheteur (« À propos de ce vendeur ») | ❌ jamais |
 | Fil illisible (captcha, lien absent) | ⚠️ 3 tentatives puis ignoré |
+
+Un point important : l'aperçu d'un fil n'est mémorisé **qu'après avoir été
+ouvert**. Un fil coupé par la limite de scan reste donc candidat au scan
+suivant — sinon son message serait marqué « vu » sans avoir été lu et il ne
+serait plus jamais inspecté (un message d'acheteur perdu).
 
 La mémoire des aperçus déjà vus est persistée dans `bot_state.json` : un
 redémarrage ne provoque donc **pas** un nouveau parcours complet de toutes les
@@ -256,6 +265,7 @@ python -u tools/db_cleanup.py --ids a1b2,c3d4
 | `human.py` | Mouvement souris Bézier, frappe clavier réaliste, scroll naturel |
 | `captcha.py` | Glissement « humain » du slider DataDome |
 | `conversation.py` | Historique SQLite async ; `fil_vers_historique()` + `build_context()` (fil prioritaire) |
+| `instance.py` | Verrou système « un seul programme par profil Chrome » (`bot.lock`) |
 
 ---
 
@@ -264,6 +274,7 @@ python -u tools/db_cleanup.py --ids a1b2,c3d4
 | Protection | Détail |
 |-----------|--------|
 | **Profil Chrome persistant** | Vrai Chrome + `chrome_profile/` → empreinte authentique et session conservée |
+| **Un seul Chrome par profil** | Un profil Chrome ne s'ouvre qu'une fois : un verrou système (`bot.lock`) empêche un second programme de le lancer, et le bot détecte le cas au lieu de relancer en boucle |
 | **Navigation par clics** | Jamais de deep-link vers `/messages/id/...` (cible n°1 de DataDome) : on clique comme un humain |
 | **Captcha DataDome** | Glissement automatique « humain » (easing, jitter, dépassement/correction, 0,75-1,4 s) puis repli sur intervention humaine |
 | **Intervalles aléatoires** | 75-180 s entre chaque scan (configurable) |
@@ -458,28 +469,46 @@ python -u tools/selftest_context.py
 Vérifie que le contexte vient bien du fil de la page, que la base ne sert qu'à
 compléter, et qu'aucun message n'est compté deux fois au raccord.
 
-**4. Pipeline complet sans rien envoyer**
+**4. Verrou d'instance (aucun navigateur requis)**
+
+```bash
+python -u tools/selftest_instance.py
+```
+
+Vérifie qu'un second programme ne peut pas lancer Chrome sur un profil déjà
+utilisé — et qu'un processus tué brutalement libère bien le verrou.
+
+> ⚠️ **N'ouvre qu'un seul programme à la fois sur `chrome_profile/`.** Un profil
+> Chrome ne peut être utilisé que par un seul Chrome. Si un second programme
+> (un outil de diagnostic, ou un second bot) tente de le lancer pendant que le
+> bot tourne, Chrome n'échoue pas franchement : il ouvre des fenêtres
+> `about:blank` dans la session existante et Playwright perd la connexion.
+> `dry_run.py` et `selftest_send.py` refusent donc de démarrer si le bot tourne
+> déjà, et `main.py` refuse de démarrer si un autre bot est en cours (verrou
+> `bot.lock`, libéré automatiquement par le système).
+
+**5. Pipeline complet sans rien envoyer**
 
 ```bash
 python -u tools/dry_run.py           # résumé
 python -u tools/dry_run.py --debug   # logs détaillés
 ```
 
-**5. Chaîne d'envoi (diagnostic, puis envoi réel)**
+**6. Chaîne d'envoi (diagnostic, puis envoi réel)**
 
 ```bash
 python -u tools/selftest_send.py                 # n'envoie RIEN
 python -u tools/selftest_send.py --confirm       # envoie réellement
 ```
 
-**6. Entretien de la base**
+**7. Entretien de la base**
 
 ```bash
 python -u tools/db_cleanup.py                    # liste (ne supprime rien)
 python -u tools/db_cleanup.py --vides --tests --apply
 ```
 
-**7. Re-cartographier le site si les sélecteurs cassent**
+**8. Re-cartographier le site si les sélecteurs cassent**
 
 ```bash
 python -u tools/explore.py && python -u tools/explore3.py
@@ -495,6 +524,7 @@ python -u tools/explore.py && python -u tools/explore3.py
 
 - **DOM Leboncoin** — Leboncoin modifie régulièrement son HTML. Les sélecteurs reposent sur des attributs stables (`data-qa-id="message-bubble"`, `data-spark-component="textarea"`, `data-qa-id="message-send"`). En cas de changement, lance `python tools/explore.py` puis `python tools/explore3.py` pour re-cartographier le site.
 - **Session** — le profil `chrome_profile/` conserve la connexion. Si elle expire, le bot ouvre Chrome et attend que tu te reconnectes.
+- **Un seul Chrome par profil** — `chrome_profile/` ne peut être ouvert que par un seul Chrome à la fois. N'ouvre donc pas ton propre Chrome sur ce profil pendant que le bot tourne, et ne lance pas deux programmes à la fois : Chrome ouvrirait des fenêtres `about:blank` au lieu de démarrer. Le verrou `bot.lock` et le refus explicite des outils couvrent ce cas.
 - **Captcha** — le glissement automatique n'aboutit pas toujours (DataDome note aussi la dynamique souris et l'empreinte). Dans ce cas il faut intervenir à la main.
 - **Rôle acheteur/vendeur** — le bot ne répond qu'aux conversations où tu es le VENDEUR (« À propos de cet acheteur »). Les conversations où tu achètes sont ignorées.
 - **Offres chiffrées** — une offre automatique Leboncoin (« Accepter 400 € ») est signalée dans les logs mais **jamais** acceptée ni refusée automatiquement : décision humaine.

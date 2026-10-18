@@ -4,6 +4,7 @@ cookies.json
 conversations.db
 conversations.db.bak-*
 bot_state.json
+bot.lock
 __pycache__/
 debugs
 prompts.py

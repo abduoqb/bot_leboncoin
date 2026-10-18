@@ -45,6 +45,10 @@ from rules import (  # noqa: E402
 
 
 async def main():
+    import instance
+    if instance.refuser_si_occupe("Ce test (dry_run)"):
+        return
+
     db = ConversationManager()
     lbc = LeboncoinClient()
     await init_session()

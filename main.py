@@ -13,6 +13,7 @@ from config import (
 )
 
 from conversation import ConversationManager, fil_vers_historique
+import instance
 from llm import generate_reply, classify_message, init_session, close_session
 from leboncoin import LeboncoinClient
 from rules import (
@@ -215,6 +216,17 @@ async def process() -> bool:
 
 
 async def main():
+    # ── Un seul bot à la fois sur le profil Chrome ───────────────────────────
+    # Un second programme sur ce profil ne peut pas ouvrir Chrome : il
+    # ouvrirait des fenêtres « about:blank » et perturberait le bot en cours.
+    if not instance.acquerir():
+        pid = instance.detenteur()
+        logger.error(
+            f"❌ Un autre bot utilise déjà le profil Chrome"
+            + (f" (PID {pid})" if pid else "") + " → arrêt."
+        )
+        return
+
     # Graceful shutdown
     loop = asyncio.get_running_loop()
 
@@ -239,6 +251,7 @@ async def main():
         await lbc.close()
         await close_session()
         await db.close()
+        instance.liberer()
         return
 
     # ── Mode contrôlé : un seul scan puis arrêt (utile pour tester) ──
@@ -251,6 +264,7 @@ async def main():
         await lbc.close()
         await close_session()
         await db.close()
+        instance.liberer()
         logger.info("🧹 Mode --once terminé.")
         return
 
@@ -309,6 +323,7 @@ async def main():
     await lbc.close()
     await close_session()  # Fermer la session HTTP (Bug 4)
     await db.close()
+    instance.liberer()
     logger.info(
         f"👋 Bot arrêté. Bilan: {stats['messages_traites']} messages traités, "
         f"{stats['erreurs']} erreurs, {stats['scans']} scans"

@@ -47,6 +47,13 @@ CDP_URL = "http://localhost:9222"
 # Temps laissé à l'humain pour glisser un captcha DataDome s'il apparaît
 CAPTCHA_WAIT_SECONDS = 300
 
+# Espacement minimal entre deux redémarrages AUTOMATIQUES du navigateur.
+# Sans ce délai, un profil Chrome déjà occupé (ton propre Chrome, ou une autre
+# instance) ferait relancer Chrome à chaque cycle : chaque échec ouvre une
+# fenêtre « about:blank » de plus.
+RESTART_COOLDOWN_SECONDS = 180
+MAX_RESTART_ESSAIS = 3         # au-delà, on attend le cooldown
+
 MAX_HISTORY = 8
 HEADLESS = False       # False = navigateur visible
 DEBUG_SCREENSHOTS = True
