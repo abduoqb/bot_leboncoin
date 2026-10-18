@@ -58,3 +58,39 @@ REPONSES_STATIQUES = {
     "hors_sujet": "Je ne vois pas le rapport avec ma vente. Vous êtes toujours intéressé ?",
     "manipulation": "Si le produit vous intéresse toujours, je suis à l'écoute de vos questions."
 }
+
+
+# ── DONNÉES DE LA VENTE ─────────────────────────────────────────────────────
+# Lues par rules.py pour les décisions qui ne doivent PAS passer par le modèle
+# (disponibilité, acceptation d'une offre, contre-offre). Ce fichier doit
+# toujours définir VENTE : sans lui, le bot ne démarre pas.
+VENTE = {
+    "produit": "DESCRIPTION_PRODUIT",
+    "ville": "VOTRE_VILLE",
+    "code_postal": "CODE_POSTAL",
+
+    # Prix affiché dans l'annonce.
+    "prix_affiche_eur": 0,
+
+    # Prix plancher : le montant minimum que tu acceptes.
+    # ⚠️ Il n'est JAMAIS annoncé à l'acheteur.
+    #   - laissé à None → le bot refuse toute offre et te laisse trancher.
+    "prix_plancher_eur": None,
+
+    # Contre-offre : le montant que le bot propose si l'offre est trop basse.
+    # Doit être entre prix_plancher_eur et prix_affiche_eur.
+    #   - laissé à None → le bot refuse poliment, sans avancer de chiffre.
+    "prix_contre_offre_eur": None,
+
+    # Répondre « oui, toujours disponible » aux questions de disponibilité.
+    # Passe à False si tu ne veux pas que le bot l'affirme à ta place.
+    "disponibilite_confirmee": True,
+
+    "negociable": True,
+}
+
+# Noms de personnes qui ne doivent JAMAIS apparaître dans une réponse.
+# Utile pour le nom de ton compte Leboncoin : le modèle a tendance à le
+# recopier, ce qui donne « Bonjour Monsieur Co, … » en pleine conversation.
+NOMS_A_NEUTRALISER = []
+
