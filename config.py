@@ -2,7 +2,11 @@ import os
 from dotenv import load_dotenv
 from prompts import PROMPT_ROUTER, BASE_PERSONA, PROMPTS, REPONSES_STATIQUES
 
-load_dotenv()
+# Racine du projet : rend le bot INDÉPENDANT du répertoire courant
+# (profil Chrome, base SQLite et dumps sont toujours au même endroit).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 # deepseek-v3.1:671b-cloud est un modèle CLOUD retiré → HTTP 410 Gone.
@@ -25,7 +29,7 @@ MAX_CONVS_PER_SCAN = 3 # Conversations inspectées/traitées max par scan (anti-
 #               les redémarrages (plus besoin de se reconnecter).
 # "cdp"     = connexion à un Chrome lancé à la main avec --remote-debugging-port.
 BROWSER_MODE = "profile"
-PROFILE_DIR = "chrome_profile"
+PROFILE_DIR = os.path.join(BASE_DIR, "chrome_profile")
 CHROME_CHANNEL = "chrome"      # "chrome" = vrai Google Chrome ; None = Chromium
 CDP_URL = "http://localhost:9222"
 

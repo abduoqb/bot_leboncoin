@@ -160,6 +160,15 @@ async def human_type(page, element, text: str):
         logger.debug(f"human_type : focus impossible ({e})")
 
     for i, char in enumerate(text):
+        # Faute de frappe occasionnelle puis correction : signal humain fort.
+        if char.isalpha() and i and random.random() < 0.04:
+            wrong = random.choice("azertyuiopqsdfghjklmwxcvbn")
+            if wrong != char.lower():
+                await page.keyboard.type(wrong, delay=0)
+                await asyncio.sleep(random.uniform(0.08, 0.25))
+                await page.keyboard.press("Backspace")
+                await asyncio.sleep(random.uniform(0.05, 0.15))
+
         await page.keyboard.type(char, delay=0)  # on gère le délai manuellement
 
         if char == " ":
@@ -176,6 +185,26 @@ async def human_type(page, element, text: str):
             delay += random.uniform(0.3, 0.8)
 
         await asyncio.sleep(delay)
+
+
+# ── Mouvements parasites ──────────────────────────────────────────────────────
+
+async def stray_move(page, n: int = 1):
+    """Petits mouvements de souris « parasites » (la main qui traîne)."""
+    try:
+        vp = await page.evaluate("() => ({ w: innerWidth, h: innerHeight })")
+    except Exception:
+        vp = {"w": 1640, "h": 900}
+    for _ in range(n):
+        try:
+            await human_move(
+                page,
+                random.uniform(100, max(200, vp["w"] - 100)),
+                random.uniform(100, max(200, vp["h"] - 200)),
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.15, 0.5))
 
 
 # ── Scroll ────────────────────────────────────────────────────────────────────

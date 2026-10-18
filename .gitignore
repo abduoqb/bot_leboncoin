@@ -8,3 +8,4 @@ prompts.py
 cle_ssh.txt
 chrome_profile/
 bot.log
+*.log

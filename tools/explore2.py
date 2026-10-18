@@ -14,6 +14,12 @@ Usage : python -u explore2.py
 Sortie : debugs/explore2_conv_<i>.json
 """
 
+import os
+import sys
+
+# Modules du bot : à la racine du projet (ce fichier est dans tools/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import json
 import os
@@ -27,7 +33,15 @@ except Exception:
     pass
 
 USER_DATA_DIR = os.path.abspath("chrome_profile")
-OUT_DIR = "debugs"
+import os
+import sys
+
+# Modules du bot : à la racine du projet (ce fichier est dans tools/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import BASE_DIR  # noqa: E402
+
+OUT_DIR = os.path.join(BASE_DIR, "debugs")
 MAX_CONVS = 5
 
 JS_STATE = r"""() => {

@@ -2,15 +2,20 @@ import sqlite3
 import json
 import logging
 import asyncio
+import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class _SyncConversationManager:
     """Gestionnaire synchrone SQLite (ne pas utiliser directement)."""
 
-    def __init__(self, db_path="conversations.db"):
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = os.path.join(_BASE_DIR, "conversations.db")
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._init_db()
 
@@ -85,7 +90,9 @@ class _SyncConversationManager:
 class ConversationManager:
     """Wrapper async pour ne pas bloquer l'event loop (Weakness 1)."""
 
-    def __init__(self, db_path="conversations.db"):
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = os.path.join(_BASE_DIR, "conversations.db")
         self._sync = _SyncConversationManager(db_path)
 
     async def get_messages(self, id_lbc: str) -> tuple:

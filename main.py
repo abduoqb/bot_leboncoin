@@ -2,19 +2,29 @@ import asyncio
 import signal
 import logging
 import logging.handlers
+import os
 import sys
 import random
 from datetime import datetime, timedelta
 from config import (
     SCAN_MIN, SCAN_MAX, NIGHT_START_HOUR, NIGHT_END_HOUR, MAX_HISTORY,
-    PROMPTS, REPONSES_STATIQUES, BASE_PERSONA, MAX_CONVS_PER_SCAN,
+    PROMPTS, REPONSES_STATIQUES, BASE_PERSONA, MAX_CONVS_PER_SCAN, BASE_DIR,
 )
 
 from conversation import ConversationManager
 from llm import generate_reply, classify_message, init_session, close_session
 from leboncoin import LeboncoinClient
+from rules import is_closing, is_manipulation, REPONSE_CLOSING
 
 # ── Logging (Bug 16: rotation 5Mo x 3 fichiers) ─────────
+# Windows : la console est en cp1252 et ferait planter tout log contenant un
+# emoji (UnicodeEncodeError → message perdu). On force UTF-8 sur les flux.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -22,7 +32,8 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.handlers.RotatingFileHandler(
-            "bot.log", encoding="utf-8", maxBytes=5_000_000, backupCount=3
+            os.path.join(BASE_DIR, "bot.log"), encoding="utf-8",
+            maxBytes=5_000_000, backupCount=3
         ),
     ],
 )
@@ -69,32 +80,56 @@ async def process() -> bool:
                 logger.info(f"⏭️ Déjà répondu à ce message, skip conv {id_conv}")
                 continue
 
-        # ── ROUTER (Appel 1) ──
-        categorie = await classify_message(texte)
-        
-        # ── REPONSES STATIQUES (0 tokens) ──
-        if categorie in REPONSES_STATIQUES:
-            reponse = REPONSES_STATIQUES[categorie]
-            logger.info(f"🛑 Catégorie statique ({categorie}), bypass LLM pass 2.")
+        # ── RÈGLES DÉTERMINISTES (avant tout appel LLM) ──
+        # 1) Injection de prompt : enjeu de sécurité → jamais délégué au modèle.
+        # 2) Formule de conclusion (« merci, bonne journée ») : le LLM y colle
+        #    presque toujours une relance commerciale, on répond en dur.
+        if is_manipulation(texte):
+            reponse = REPONSES_STATIQUES["manipulation"]
+            logger.info("🛡️ Injection de prompt détectée → réponse figée (0 appel LLM).")
+        elif is_closing(texte):
+            reponse = REPONSE_CLOSING
+            logger.info("🧷 Conclusion détectée → réponse figée (0 appel LLM).")
         else:
-            # ── GENERATION DYNAMIQUE (Appel 2) ──
-            # Récupérer le mini-prompt spécialisé
-            system_prompt = PROMPTS.get(categorie, PROMPTS["general"])
-            
-            # Construire le contexte avec BASE_PERSONA (Bug 5 : cohérence historique)
-            # L'historique est stocké avec un persona neutre, on remplace ensuite
-            context, nb_envois = await db.build_context(id_conv, texte, BASE_PERSONA, MAX_HISTORY)
-            # Remplacer le system prompt par le mini-prompt spécialisé du tour actuel
-            context[0]["content"] = system_prompt
-            info_envois = f"\n\n[INFO INTERNE: Tu as déjà échangé {nb_envois} message(s) avec cet acheteur. Réponds au dernier message.]"
-            context[0]["content"] += info_envois
+            # ── ROUTER (Appel 1) ──
+            categorie = await classify_message(texte)
 
-            # Génération LLM
-            reponse = await generate_reply(context)
-            if not reponse:
-                logger.warning(f"⏭️ Pas de réponse LLM pour conv {id_conv}")
-                stats["erreurs"] += 1
-                continue
+            # ── REPONSES STATIQUES (0 tokens) ──
+            if categorie in REPONSES_STATIQUES:
+                reponse = REPONSES_STATIQUES[categorie]
+                logger.info(f"🛑 Catégorie statique ({categorie}), bypass LLM pass 2.")
+            else:
+                # ── GENERATION DYNAMIQUE (Appel 2) ──
+                # Récupérer le mini-prompt spécialisé
+                system_prompt = PROMPTS.get(categorie, PROMPTS["general"])
+
+                # Construire le contexte avec BASE_PERSONA (Bug 5 : cohérence historique)
+                # L'historique est stocké avec un persona neutre, on remplace ensuite
+                context, nb_envois = await db.build_context(
+                    id_conv, texte, BASE_PERSONA, MAX_HISTORY)
+                # Remplacer le system prompt par le mini-prompt spécialisé du tour actuel
+                context[0]["content"] = system_prompt
+                info_envois = (
+                    f"\n\n[INFO INTERNE: Tu as déjà échangé {nb_envois} message(s) "
+                    f"avec cet acheteur. Réponds au dernier message.]"
+                )
+                context[0]["content"] += info_envois
+
+                # Génération LLM
+                reponse = await generate_reply(context)
+
+                # Repli : une pré-réponse proposée par leboncoin (le cas échéant)
+                if not reponse:
+                    qr = msg.get("quick_replies") or []
+                    if qr:
+                        reponse = qr[0]
+                        logger.info(
+                            f"💡 Repli sur la pré-réponse leboncoin : {reponse[:70]}…")
+
+                if not reponse:
+                    logger.warning(f"⏭️ Pas de réponse LLM pour conv {id_conv}")
+                    stats["erreurs"] += 1
+                    continue
 
         logger.info(f"💬 Réponse: {reponse[:80]}...")
 
@@ -147,6 +182,19 @@ async def main():
         await db.close()
         return
 
+    # ── Mode contrôlé : un seul scan puis arrêt (utile pour tester) ──
+    if "--once" in sys.argv:
+        logger.info("▶️ Mode --once : un seul scan, puis arrêt.")
+        try:
+            await process()
+        except Exception as e:
+            logger.error(f"❌ Erreur scan unique: {e}", exc_info=True)
+        await lbc.close()
+        await close_session()
+        await db.close()
+        logger.info("🧹 Mode --once terminé.")
+        return
+
     logger.info(f"🚀 Bot démarré — comportement humain activé (attente aléatoire + pause nocturne {NIGHT_START_HOUR}h-{NIGHT_END_HOUR}h)")
 
     while not shutdown_event.is_set():
@@ -165,7 +213,11 @@ async def main():
             continue  # re-check l'heure au réveil
 
         try:
-            had_messages = await process()
+            if not await lbc.ensure_alive():
+                logger.error("❌ Navigateur indisponible, nouvelle tentative au prochain cycle.")
+                had_messages = False
+            else:
+                had_messages = await process()
         except Exception as e:
             logger.error(f"❌ Erreur boucle principale: {e}", exc_info=True)
             stats["erreurs"] += 1

@@ -14,11 +14,13 @@ Principes (calibrés sur le DOM réel du site) :
                                                  sortant = rounded-br-none)
       champ   : [data-spark-component="textarea"]
       envoyer : [data-qa-id="message-send"]
-  - Si un captcha DataDome apparaît : on NE tente pas de le résoudre,
-    on met le bot en pause et on demande à l'humain de le glisser.
+  - Si un captcha DataDome apparaît : on tente d'abord un glissement
+    automatique « humain » (captcha.py) ; en cas d'échec, on met le bot
+    en pause et on demande à l'humain de le glisser.
 """
 
 import os
+import sys
 import random
 import logging
 import asyncio
@@ -37,6 +39,8 @@ from config import (
 import human as H
 
 logger = logging.getLogger(__name__)
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 LBC_HOME = "https://www.leboncoin.fr/"
 LBC_MESSAGES = "https://www.leboncoin.fr/messages"
@@ -145,20 +149,40 @@ JS_THREAD = r"""() => {
   }
 
   // Messages AUTOMATIQUES leboncoin = éléments du fil SANS bulle de message.
+  // On en distingue :
+  //   • l'en-tête « À propos de cet acheteur / ce vendeur » (donne NOTRE rôle) ;
+  //   • le bandeau « Envoyez une réponse rapide » (pré-réponses proposées) ;
+  //   • les vrais messages système (offre reçue, disponibilité…).
   const sysTexts = [];
+  const quickReplies = [];
+  let counterpart = null;
   if (container) {
     for (const li of container.children) {
       if (li.querySelector('[data-qa-id="message-bubble"]')) continue;
       const t = clean(li.innerText);
-      if (t && t.length < 400 && !/^À propos de cet acheteur/i.test(t)) sysTexts.push(t);
+      if (!t) continue;
+      if (/^À propos de cet acheteur/i.test(t)) { counterpart = 'acheteur'; continue; }
+      if (/^À propos de ce vendeur/i.test(t)) { counterpart = 'vendeur'; continue; }
+      if (/Envoyez une réponse rapide/i.test(t)) {
+        const chips = [...li.querySelectorAll('[data-spark-component="chip"]')]
+          .map(c => clean(c.innerText)).filter(Boolean);
+        if (chips.length) quickReplies.push(...chips);
+        else {
+          const s = t.replace(/^Envoyez une réponse rapide\s*/i, '').trim();
+          if (s) quickReplies.push(s);
+        }
+        continue;
+      }
+      if (t.length < 400) sysTexts.push(t);
     }
   }
 
-  // Une offre se reconnaît DANS le fil affiché (pas ailleurs dans la page)
-  const threadText = container ? (container.innerText || '') : '';
-  const hasOffer = /Offre reçue|Accepter\s+\d/i.test(threadText)
-    || [...root.querySelectorAll('button')]
-        .filter(b => visible(b) && /^\s*Accepter\b/i.test(b.innerText || '')).length > 0;
+  // Une offre se reconnaît UNIQUEMENT dans les messages automatiques du fil
+  // (jamais dans les bulles : notre propre réponse contient le mot « offre »,
+  // et la bannière cookies contient un bouton « Accepter »).
+  const sysJoined = sysTexts.join('\n');
+  const hasOffer = /Offre reçue|Vous avez\s+\d+\s*heures?\s+pour accepter|Accepter\s+\d+\s*€/i
+    .test(sysJoined);
 
   return {
     url: location.href,
@@ -169,6 +193,8 @@ JS_THREAD = r"""() => {
     buyersText: (last && last.side === 'in' && trailingIn.length)
       ? trailingIn.join('\n') : null,
     hasOffer,
+    counterpart,
+    quickReplies: quickReplies.slice(0, 5),
     systemTexts: sysTexts.slice(0, 5),
   };
 }"""
@@ -246,6 +272,37 @@ class LeboncoinClient:
         cookies = os.path.join(PROFILE_DIR, "Default", "Cookies")
         return os.path.exists(cookies)
 
+    async def ensure_alive(self) -> bool:
+        """Vérifie que le navigateur répond encore ; le relance sinon.
+
+        Rend le bot autonome face à un crash/fermeture du navigateur pendant
+        une longue session (le profil persistant conserve la connexion).
+        """
+        try:
+            if self.page and not self.page.is_closed():
+                await self.page.evaluate("() => 1")
+                return True
+        except Exception:
+            pass
+
+        logger.warning("⚠️ Navigateur/page indisponible → redémarrage automatique.")
+        try:
+            await self.close()
+        except Exception:
+            pass
+        # Réinitialise l'état volatil (le serveur redevient la source de vérité)
+        self._shutdown = False
+        self._is_cdp = False
+        self._current_thread_url = None
+        self._last_previews.clear()
+        self._answered.clear()
+        try:
+            await self.start()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Redémarrage du navigateur impossible : {e}")
+            return False
+
     # ── Détection captcha / connexion ─────────────────────────────────────────
 
     async def _state(self) -> dict:
@@ -264,8 +321,27 @@ class LeboncoinClient:
         await asyncio.sleep(random.uniform(2.0, 3.5))
 
     async def _wait_human(self, raison: str) -> bool:
-        """Met le bot en pause et attend qu'un humain se connecte / glisse le
-        captcha (on ne résout JAMAIS le captcha automatiquement)."""
+        """Captcha / connexion.
+
+        1) On tente d'abord un glissement automatique du slider DataDome
+           (comportement humain, cf. captcha.py).
+        2) En cas d'échec seulement, on met le bot en pause et on attend
+           une intervention humaine.
+        """
+        if "captcha" in raison.lower():
+            try:
+                from captcha import is_captcha_present, solve_slider
+                # On ne tente le glissement QUE si un vrai captcha est affiché
+                # (sinon, ex. page de connexion, on doit attendre l'humain).
+                if await is_captcha_present(self.page):
+                    if await solve_slider(self.page):
+                        logger.info("🤖 Captcha franchi automatiquement.")
+                        if "/messages" not in self.page.url:
+                            await self._goto(LBC_MESSAGES)
+                        return True
+            except Exception as e:
+                logger.warning(f"Résolution auto du captcha impossible : {e}")
+
         logger.warning(f"⏸️ {raison} — intervention humaine requise.")
         print("\n" + "=" * 62)
         print("  ⚠️  ACTION HUMAINE DEMANDÉE")
@@ -328,13 +404,18 @@ class LeboncoinClient:
             await asyncio.sleep(random.uniform(2.0, 3.5))
 
         st = await self._state()
-        if st.get("captcha") or st.get("login"):
-            if not await self._wait_human("Captcha / connexion sur la liste"):
+        if st.get("captcha"):
+            if not await self._wait_human("Captcha DataDome sur la liste"):
                 return False
-            await self._goto(LBC_MESSAGES)
-            st = await self._state()
-            return not st.get("captcha") and not st.get("login")
-        return True
+        elif st.get("login"):
+            if not await self._wait_human("Connexion à Leboncoin requise (liste)"):
+                return False
+        else:
+            return True
+        # Après résolution : on revient sur la liste et on re-vérifie
+        await self._goto(LBC_MESSAGES)
+        st = await self._state()
+        return not st.get("captcha") and not st.get("login")
 
     async def _open_thread(self, conv_url: str) -> bool:
         """Ouvre un fil en CLIQUANT le lien depuis la liste (jamais de deep-link)."""
@@ -420,19 +501,19 @@ class LeboncoinClient:
         nb_non_lues = sum(1 for it in items if it["unread"])
         logger.info(f"📬 {len(items)} conversation(s), {nb_non_lues} non lue(s)")
 
-        # Candidats : non-lus, aperçu modifié, ou jamais vus.
-        # On ignore les conversations auxquelles on a déjà répondu tant qu'aucun
-        # nouveau message (badge non lu) n'est apparu.
+        # Candidats : non-lus, aperçu modifié/jamais vu, ou fil auquel on n'a
+        # pas encore répondu. `_answered` n'empêche PAS de détecter un aperçu
+        # modifié (un nouveau message sans badge doit rester visible).
         todo = []
         for it in items:
             id_conv = it["href"].rstrip("/").split("/")[-1]
             if it["unread"]:
                 self._answered.discard(id_conv)
-            elif id_conv in self._answered:
-                continue
-            if (it["unread"]
-                    or it["href"] not in self._last_previews
-                    or self._last_previews[it["href"]] != it["preview"]):
+            preview_changed = (
+                it["href"] not in self._last_previews
+                or self._last_previews[it["href"]] != it["preview"]
+            )
+            if it["unread"] or preview_changed or id_conv not in self._answered:
                 todo.append(it)
 
         max_inspect = MAX_CONVS_PER_SCAN + 3
@@ -456,10 +537,22 @@ class LeboncoinClient:
 
             inspected += 1
             thread = await self._read_thread(conv_url)
-            self._last_previews[href] = it["preview"]  # vue → ne sera plus rejouée
 
             if thread is None:
                 continue
+
+            # Conversation où NOUS sommes l'acheteur (« À propos de ce vendeur ») :
+            # le bot ne doit jamais répondre à la place du vendeur d'une AUTRE annonce.
+            if thread.get("counterpart") == "vendeur":
+                logger.info(f"⏭️ Conv {id_conv} : nous sommes l'acheteur → ignorée.")
+                self._last_previews[href] = it["preview"]
+                continue
+
+            # Pré-réponses proposées par leboncoin (facultatives) : on les trace.
+            qr = thread.get("quickReplies") or []
+            if qr:
+                logger.info(f"💡 Pré-réponse(s) leboncoin proposée(s) : "
+                            + " | ".join(q[:60] for q in qr[:3]))
 
             # Offre reçue : message AUTOMATIQUE leboncoin → décision humaine.
             # On ne répond JAMAIS à la place de l'offre, mais un vrai message
@@ -473,18 +566,24 @@ class LeboncoinClient:
 
             if thread.get("lastSide") == "out":
                 logger.debug(f"⏭️ Dernier message = nous, conv ignorée ({id_conv})")
+                self._last_previews[href] = it["preview"]
                 continue
 
             texte = thread.get("buyersText")
             if not texte:
                 logger.debug(f"⏭️ Fil sans message d'acheteur ({id_conv})")
+                self._last_previews[href] = it["preview"]
                 continue
+
+            # ⚠️ On NE marque PAS ce fil comme « vu » ici : s'il est renvoyé comme
+            # candidat puis que l'envoi échoue, il doit être retenté au scan suivant.
 
             conversations.append({
                 "id_conv": id_conv,
                 "conv_url": conv_url,
                 "texte": texte,
                 "unread": it["unread"],
+                "quick_replies": thread.get("quickReplies") or [],
             })
             logger.info(f"💬 Conv {id_conv}: {texte[:80]}…")
 
@@ -498,6 +597,13 @@ class LeboncoinClient:
 
         data, prev_sig, stable = None, object(), 0
         await H.pause(1.2, 2.0)  # laisse le fil se rendre complètement
+        # Comportement humain : on parcourt le fil du regard (scroll) avant de lire
+        if random.random() < 0.6:
+            await H.human_scroll(self.page, "up", random.randint(50, 170))
+            await H.pause(0.25, 0.7)
+            await H.human_scroll(self.page, "down", random.randint(70, 220))
+        if random.random() < 0.5:
+            await H.stray_move(self.page, 1)
         for _ in range(tries):
             try:
                 data = await self.page.evaluate(JS_THREAD)
@@ -553,12 +659,29 @@ class LeboncoinClient:
 
             await H.human_click(self.page, champ)
             await H.pause(0.3, 0.8)
+            # Le champ peut déjà contenir quelque chose (pré-réponse leboncoin,
+            # brouillon, texte précédent). On le VIDE pour ne jamais envoyer
+            # un message mélangé.
+            await self._clear_field(champ)
             try:
                 await H.human_type(self.page, champ, texte)
             except Exception as e:
                 logger.warning(f"Frappe humaine en échec, repli fill : {e}")
                 await champ.fill(texte)
             await H.pause(0.5, 1.5)
+
+            # Contrôle du contenu réellement présent dans le champ
+            try:
+                val = (await champ.input_value()).strip()
+            except Exception:
+                val = ""
+            if val != texte.strip():
+                logger.warning(
+                    f"Conv {id_conv} : champ inattendu ({val[:60]!r}) → saisie directe"
+                )
+                await self._clear_field(champ)
+                await champ.fill(texte)
+                await H.pause(0.3, 0.7)
 
             btn = await self.page.query_selector(SEND_BTN)
             if not btn:
@@ -574,10 +697,23 @@ class LeboncoinClient:
                     break
                 await asyncio.sleep(0.25)
 
-            await H.human_click(self.page, btn)
-            await H.pause(1.5, 2.5)
+            state = await btn.evaluate("b => !!b.disabled || b.getAttribute('aria-disabled') === 'true'")
+            if state:
+                logger.error(f"Conv {id_conv} : bouton d'envoi toujours inactif → abandon")
+                await self._clear_field(champ)
+                return False
 
-            sent = await self._verify_sent(texte)
+            # Nombre de bulles avant envoi (pour confirmer l'apparition d'une nouvelle)
+            try:
+                before = await self.page.evaluate(JS_THREAD)
+                prev_count = (before or {}).get("count", 0)
+            except Exception:
+                prev_count = 0
+
+            await H.human_click(self.page, btn)
+            await H.pause(0.8, 1.5)
+
+            sent = await self._verify_sent(texte, prev_count)
             if sent:
                 self._answered.add(id_conv)
                 logger.info(f"Message envoyé ✅ conv {id_conv}")
@@ -596,23 +732,41 @@ class LeboncoinClient:
             logger.error(f"Erreur envoi message conv {id_conv} : {e}")
             return False
 
-    async def _verify_sent(self, snippet: str) -> bool:
-        # 1) une bulle sortante contient notre texte
+    async def _clear_field(self, champ):
+        """Vide le champ de saisie (pré-réponse, brouillon, texte précédent…)."""
         try:
-            data = await self.page.evaluate(JS_THREAD)
+            await champ.click(timeout=5000)
+            mod = "Meta" if sys.platform == "darwin" else "Control"
+            await self.page.keyboard.press(f"{mod}+A")
+            await self.page.keyboard.press("Delete")
+            await H.pause(0.1, 0.3)
+        except Exception as e:
+            logger.debug(f"Vidage du champ impossible : {e}")
+
+    async def _verify_sent(self, snippet: str, prev_count: int = 0) -> bool:
+        """Confirme l'envoi par l'apparition d'une NOUVELLE bulle sortante
+        contenant notre texte.
+
+        Volontairement STRICT : on ne déduit pas l'envoi du simple vidage du
+        champ (le champ peut se vider alors que l'envoi a échoué, ce qui
+        produirait un faux « envoyé » et perdrait le message).
+        """
+        core = snippet.strip()[:40]
+        for _ in range(30):  # ~15 s
+            try:
+                data = await self.page.evaluate(JS_THREAD)
+            except Exception:
+                await asyncio.sleep(0.5)
+                continue
             if data and data.get("lastSide") == "out":
-                core = snippet[:40].strip()
-                if core and core in (data.get("lastText") or ""):
+                lt = data.get("lastText") or ""
+                if not core or core in lt:
                     return True
-        except Exception:
-            pass
-        # 2) le champ a été vidé → l'envoi a bien eu lieu
-        try:
-            champ = await self.page.query_selector(TEXTAREA)
-            if champ and not (await champ.input_value()).strip():
-                return True
-        except Exception:
-            pass
+                # bulle sortante mais texte différent : on accepte seulement si
+                # le nombre de bulles a réellement augmenté
+                if data.get("count", 0) > prev_count:
+                    return True
+            await asyncio.sleep(0.5)
         return False
 
     # ── Debug / arrêt ────────────────────────────────────────────────────────
@@ -620,10 +774,12 @@ class LeboncoinClient:
     async def debug_dump_page(self, label: str = "debug"):
         import re as _re
         safe = _re.sub(r"[^a-z0-9_]", "_", label.lower())
-        os.makedirs("debugs", exist_ok=True)
+        dbg = os.path.join(_BASE_DIR, "debugs")
+        os.makedirs(dbg, exist_ok=True)
         try:
-            await self.page.screenshot(path=f"debugs/debug_{safe}.png", full_page=True)
-            with open(f"debugs/debug_{safe}.html", "w", encoding="utf-8") as f:
+            await self.page.screenshot(
+                path=os.path.join(dbg, f"debug_{safe}.png"), full_page=True)
+            with open(os.path.join(dbg, f"debug_{safe}.html"), "w", encoding="utf-8") as f:
                 f.write(await self.page.content())
             logger.info(f"📸 Debug dump : debugs/debug_{safe}.png + .html")
         except Exception as e:

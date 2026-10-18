@@ -10,9 +10,14 @@ un humain (cela les marque « lus »). Aucune autre action n'est effectuée.
 Usage : python -u dry_run.py
 """
 
+import os
+import sys
+
+# Modules du bot : à la racine du projet (ce fichier est dans tools/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import logging
-import sys
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -31,6 +36,7 @@ from config import PROMPTS, BASE_PERSONA, REPONSES_STATIQUES  # noqa: E402
 from conversation import ConversationManager  # noqa: E402
 from llm import classify_message, generate_reply, init_session, close_session  # noqa: E402
 from leboncoin import LeboncoinClient  # noqa: E402
+from rules import is_closing, is_manipulation, REPONSE_CLOSING  # noqa: E402
 
 
 async def main():
@@ -49,6 +55,20 @@ async def main():
         for m in msgs:
             print(f"\n--- conv {m['id_conv']}  (non_lu={m['unread']}) ---")
             print(f"  ACHETEUR  : {m['texte'][:300]}")
+            qr = m.get("quick_replies") or []
+            if qr:
+                print(f"  PRÉ-RÉPONSES LEBONCOIN : {' | '.join(q[:60] for q in qr[:3])}")
+
+            # Règles déterministes, comme dans main.py
+            if is_manipulation(m["texte"]):
+                print("  CATÉGORIE : manipulation (règle)")
+                print(f"  RÉPONSE (statique) : {REPONSES_STATIQUES['manipulation']}")
+                continue
+            if is_closing(m["texte"]):
+                print("  CATÉGORIE : conclusion (règle)")
+                print(f"  RÉPONSE (règle) : {REPONSE_CLOSING}")
+                continue
+
             cat = await classify_message(m['texte'])
             print(f"  CATÉGORIE : {cat}")
             if cat in REPONSES_STATIQUES:

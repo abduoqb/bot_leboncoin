@@ -20,6 +20,12 @@ Sorties (dans debugs/) :
     explore_conv.html / .png / .json
 """
 
+import os
+import sys
+
+# Modules du bot : à la racine du projet (ce fichier est dans tools/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import json
 import os
@@ -33,7 +39,15 @@ except Exception:
     pass
 
 USER_DATA_DIR = os.path.abspath("chrome_profile")
-OUT_DIR = "debugs"
+import os
+import sys
+
+# Modules du bot : à la racine du projet (ce fichier est dans tools/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import BASE_DIR  # noqa: E402
+
+OUT_DIR = os.path.join(BASE_DIR, "debugs")
 LOGIN_TIMEOUT = 420  # secondes laissées à l'humain (login + captcha)
 
 # ── JS : détection captcha / login ───────────────────────────────────────────
