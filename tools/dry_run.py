@@ -32,11 +32,16 @@ logging.basicConfig(
 if "--debug" in sys.argv:
     logging.getLogger().setLevel(logging.DEBUG)
 
-from config import PROMPTS, BASE_PERSONA, REPONSES_STATIQUES  # noqa: E402
+from config import (  # noqa: E402
+    PROMPTS, BASE_PERSONA, REPONSES_STATIQUES, NOMS_A_NEUTRALISER, VENTE,
+)
 from conversation import ConversationManager  # noqa: E402
 from llm import classify_message, generate_reply, init_session, close_session  # noqa: E402
 from leboncoin import LeboncoinClient  # noqa: E402
-from rules import is_closing, is_manipulation, REPONSE_CLOSING  # noqa: E402
+from rules import (  # noqa: E402
+    is_closing, is_manipulation, is_disponibilite, reponse_disponibilite,
+    REPONSE_CLOSING, sanitize_reply,
+)
 
 
 async def main():
@@ -68,6 +73,11 @@ async def main():
                 print("  CATÉGORIE : conclusion (règle)")
                 print(f"  RÉPONSE (règle) : {REPONSE_CLOSING}")
                 continue
+            if is_disponibilite(m["texte"]):
+                print("  CATÉGORIE : disponibilité (règle)")
+                print(f"  RÉPONSE (règle) : "
+                      f"{reponse_disponibilite(VENTE.get('disponibilite_confirmee'), VENTE.get('ville'))}")
+                continue
 
             cat = await classify_message(m['texte'])
             print(f"  CATÉGORIE : {cat}")
@@ -75,8 +85,16 @@ async def main():
                 print(f"  RÉPONSE (statique) : {REPONSES_STATIQUES[cat]}")
             else:
                 ctx, nb = await db.build_context(m["id_conv"], m["texte"], BASE_PERSONA, 8)
+                for h in ctx[1:-1]:
+                    if h.get("role") == "assistant":
+                        h["content"] = sanitize_reply(
+                            h["content"], has_history=True,
+                            noms=NOMS_A_NEUTRALISER)
                 ctx[0]["content"] = PROMPTS.get(cat, PROMPTS["general"])
                 rep = await generate_reply(ctx)
+                if rep:
+                    rep = sanitize_reply(
+                        rep, has_history=nb > 0, noms=NOMS_A_NEUTRALISER)
                 print(f"  RÉPONSE (LLM) : {rep}")
 
         print(f"\n{'=' * 70}\n  Test à blanc terminé — AUCUN message n'a été envoyé.\n{'=' * 70}")

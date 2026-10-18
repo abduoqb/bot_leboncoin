@@ -6,9 +6,10 @@ Bot Python qui répond automatiquement aux messages de tes annonces Leboncoin en
 
 ## ✨ Fonctionnalités
 
+- **Réponses naturelles et fiables** — le bot parle comme le vendeur (première personne), n'écrit jamais de nom de personne, ne salue qu'une fois par conversation, ne contredit jamais une donnée vérifiée et n'ouvre un fil que s'il y a une raison de le faire
 - **LLM local 2-étapes** — classification du message (router) puis réponse spécialisée via gemma3:4b
 - **Envoi réel vérifié** — le bot tape et envoie; l'envoi n'est validé que par l'apparition d'une nouvelle bulle sortante (jamais par un simple vidage de champ)
-- **Anti-détection avancée** — frappe humaine au clavier (avec fautes de frappe corrigées), mouvements de souris Bézier, scrolls naturels, navigation dispersée, pause nocturne
+- **Anti-détection avancée** — frappe humaine au clavier (avec fautes de frappe corrigées), mouvements de souris Bézier, scrolls naturels, navigation dispersée, pause nocturne, **aucune relecture inutile des conversations**
 - **Captcha DataDome** — tentative de glissement automatique « humain » du slider, avec repli sur intervention humaine
 - **Pré-réponses Leboncoin** — détectées, tracées, et utilisées en repli si le LLM ne produit rien
 - **Ne répond jamais à la place d'un vendeur** — les conversations où TU es l'acheteur (« À propos de ce vendeur ») sont ignorées
@@ -35,11 +36,13 @@ bot_lbc/
 ├── llm.py             # Client Ollama async (classify + generate, session partagée)
 ├── leboncoin.py       # LeboncoinClient (Playwright, profil Chrome persistant)
 ├── captcha.py         # Glissement « humain » du slider DataDome
-├── rules.py           # Règles déterministes AVANT le LLM (conclusion, injection de prompt)
+├── rules.py           # Règles déterministes AVANT le LLM (conclusion, injection,
+│                      #   disponibilité) + nettoyage des réponses générées
 ├── human.py           # Simulation humaine (Bézier, frappe clavier, scroll, pauses)
 ├── tools/             # Outils de diagnostic et de test (non utilisés en production)
 │   ├── dry_run.py         # Test À BLANC : lit + génère, sans rien envoyer
 │   ├── selftest_llm.py    # Boucle qualité : batterie de messages → catégorie + réponse
+│   ├── selftest_scan.py   # Vérifie qu'aucun fil déjà réglé n'est rouvert (0 navigateur)
 │   ├── selftest_send.py   # Diagnostic/envoi réel contrôlé sur UNE conversation
 │   ├── explore.py         # Cartographie la liste des conversations
 │   ├── explore2.py        # Anatomie d'un fil (bulles, conteneur, compositeur)
@@ -48,6 +51,7 @@ bot_lbc/
 ├── .gitignore
 ├── chrome_profile/    # Auto-généré — profil Chrome persistant (login conservé)
 ├── conversations.db   # Auto-généré — historique SQLite
+├── bot_state.json     # Auto-généré — mémoire des aperçus déjà vus (anti-boucle)
 └── debugs/            # Auto-généré — captures/DOM d'un échec de chargement
 ```
 
@@ -143,6 +147,7 @@ Message acheteur
  Règles déterministes (rules.py)   ← avant tout appel LLM
       │   • injection de prompt  → réponse figée (sécurité)
       │   • formule de conclusion → réponse figée
+      │   • question de disponibilité → réponse figée (donnée vérifiée)
       ▼
  Appel 1 — Classifier LLM (gemma3, temp=0, max 5 tokens)
       │     → renvoie UN mot : negociation / produit / rdv /
@@ -151,11 +156,36 @@ Message acheteur
  Appel 2 — Réponse LLM avec le mini-prompt spécialisé
       │     (ou réponse statique si hors_sujet / manipulation)
       ▼
+ Nettoyage déterministe (rules.py::sanitize_reply)
+      │     • aucun nom de personne, « Monsieur Co » → « Monsieur »
+      │     • une seule salutation par conversation
+      │     • typographie française
+      ▼
  Vérification : nouvelle bulle SORTANTE contenant notre texte
       │     (sinon l'envoi est considéré comme échoué → retenté au scan suivant)
       ▼
  Historique enregistré en base (uniquement après un envoi confirmé)
 ```
+
+### Quelle conversation le bot ouvre-t-il ?
+
+Ouvrir un fil recharge une page **et le marque « lu » côté serveur**. Le bot
+n'ouvre donc un fil que s'il a une raison de le faire (`leboncoin.py` →
+`_candidats`), sinon il laisse la liste tranquille :
+
+| Situation | Le fil est-il ouvert ? |
+|-----------|------------------------|
+| L'aperçu a changé (nouveau message) | ✅ oui |
+| L'aperçu n'a jamais été vu (démarrage, nouvelle annonce) | ✅ oui, une fois |
+| Non lu et jamais inspecté depuis le démarrage | ✅ oui, une fois |
+| Réponse en attente (envoi raté) | ✅ oui, **max 3 tentatives** puis abandon |
+| Déjà inspecté, rien à répondre | ❌ non |
+| Nous sommes l'acheteur (« À propos de ce vendeur ») | ❌ jamais |
+| Fil illisible (captcha, lien absent) | ⚠️ 3 tentatives puis ignoré |
+
+La mémoire des aperçus déjà vus est persistée dans `bot_state.json` : un
+redémarrage ne provoque donc **pas** un nouveau parcours complet de toutes les
+conversations.
 
 **Fichiers impliqués :**
 
@@ -163,7 +193,7 @@ Message acheteur
 |---------|------|
 | `config.py` | Constantes techniques (délais, modèle, chemins) + `BASE_DIR` |
 | `prompts.py` | `PROMPT_ROUTER`, `BASE_PERSONA`, `PROMPTS`, `REPONSES_STATIQUES` (git‑ignored) |
-| `rules.py` | Règles déterministes : conclusion, injection de prompt |
+| `rules.py` | Règles déterministes : conclusion, injection de prompt, disponibilité + `sanitize_reply()` |
 | `llm.py` | `classify_message()` (appel 1) + `generate_reply()` (appel 2) |
 | `main.py` | Orchestration : règles → classification → génération → envoi |
 | `leboncoin.py` | Lecture des conversations, détection du rôle, envoi vérifié |
@@ -180,7 +210,9 @@ Message acheteur
 | **Profil Chrome persistant** | Vrai Chrome + `chrome_profile/` → empreinte authentique et session conservée |
 | **Navigation par clics** | Jamais de deep-link vers `/messages/id/...` (cible n°1 de DataDome) : on clique comme un humain |
 | **Captcha DataDome** | Glissement automatique « humain » (easing, jitter, dépassement/correction, 0,75-1,4 s) puis repli sur intervention humaine |
-| **Intervalles aléatoires** | 45-120s entre chaque scan (configurable) |
+| **Intervalles aléatoires** | 75-180 s entre chaque scan (configurable) |
+| **Aucune relecture inutile** | Un fil n'est ouvert que si son aperçu change, s'il est non lu et jamais vu, ou si une réponse est en attente. Ouvrir un fil le marque « lu » : boucler dessus était le principal signal |
+| **Mémoire persistante** | `bot_state.json` : un redémarrage ne relit pas toutes les conversations |
 | **Pause nocturne** | Inactif entre 1h et 7h, aucune requête |
 | **Repos intelligent** | Après 10 scans vides → pause 1h |
 | **Navigation dispersée** | Le bot passe par l'accueil avant chaque consultation de messages |
@@ -202,8 +234,8 @@ Toutes les constantes sont dans `config.py` :
 |----------|--------|-------------|
 | `OLLAMA_MODEL` | `gemma3:4b` | Modèle Ollama (local, gratuit) |
 | `OLLAMA_URL` | `http://localhost:11434/api/chat` | Endpoint Ollama |
-| `SCAN_MIN` | `45` | Secondes minimum entre scans |
-| `SCAN_MAX` | `120` | Secondes maximum entre scans |
+| `SCAN_MIN` | `75` | Secondes minimum entre scans |
+| `SCAN_MAX` | `180` | Secondes maximum entre scans |
 | `NIGHT_START_HOUR` | `1` | Début pause nocturne (1h) |
 | `NIGHT_END_HOUR` | `6` | Fin pause nocturne |
 | `TYPING_SPEED_MIN` | `40` | Ms minimum entre frappes |
@@ -344,24 +376,35 @@ python -u tools/selftest_llm.py          # batterie complète
 python -u tools/selftest_llm.py --case 5 # un seul cas
 ```
 
-Affiche, pour 16 messages d'acheteurs réalistes, la catégorie choisie et la
-réponse générée. Boucle : repérer un cas raté → ajuster `prompts.py` → relancer.
+Affiche, pour 24 messages d'acheteurs réalistes (+ 4 conversations déjà
+engagées), la catégorie choisie et la réponse générée, ainsi que les contrôles
+déterministes (noms de personnes, salutations, disponibilité). Boucle : repérer
+un cas raté → ajuster `prompts.py` → relancer.
 
-**2. Pipeline complet sans rien envoyer**
+**2. Boucle de scan (aucun navigateur requis)**
+
+```bash
+python -u tools/selftest_scan.py
+```
+
+Vérifie qu'un fil déjà réglé n'est **jamais** rouvert : c'est cette logique qui
+évitait au bot de relire en boucle les conversations lues.
+
+**3. Pipeline complet sans rien envoyer**
 
 ```bash
 python -u tools/dry_run.py           # résumé
 python -u tools/dry_run.py --debug   # logs détaillés
 ```
 
-**3. Chaîne d'envoi (diagnostic, puis envoi réel)**
+**4. Chaîne d'envoi (diagnostic, puis envoi réel)**
 
 ```bash
 python -u tools/selftest_send.py                 # n'envoie RIEN
 python -u tools/selftest_send.py --confirm       # envoie réellement
 ```
 
-**4. Re-cartographier le site si les sélecteurs cassent**
+**5. Re-cartographier le site si les sélecteurs cassent**
 
 ```bash
 python -u tools/explore.py && python -u tools/explore3.py

@@ -21,6 +21,7 @@ Principes (calibrés sur le DOM réel du site) :
 
 import os
 import sys
+import json
 import random
 import logging
 import asyncio
@@ -41,6 +42,14 @@ import human as H
 logger = logging.getLogger(__name__)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# État persistant : ce que le bot a déjà vu dans la liste. Évite de
+# re-parcourir tous les fils à chaque redémarrage.
+_STATE_FILE = os.path.join(_BASE_DIR, "bot_state.json")
+
+# Nombre de tentatives (envoi raté / fil qui ne s'ouvre pas) avant d'abandonner
+# une conversation. Sans borne, un fil cassé serait rouvert à chaque scan.
+MAX_TENTATIVES = 3
 
 LBC_HOME = "https://www.leboncoin.fr/"
 LBC_MESSAGES = "https://www.leboncoin.fr/messages"
@@ -209,8 +218,47 @@ class LeboncoinClient:
         self._is_cdp = False
         self._shutdown = False
         self._current_thread_url = None
-        self._last_previews = {}   # href -> aperçu normalisé (détection de nouveauté)
-        self._answered = set()     # id_conv déjà répondus (évite de les rouvrir)
+
+        # ── État de veille ───────────────────────────────────────────────────
+        # Le bot n'ouvre un fil QUE s'il a une raison de le faire : ouvrir un
+        # fil le marque « lu » côté serveur et recharge la page. Boucler sur
+        # des conversations déjà lues est inutile et très repérable.
+        self._last_previews = {}   # href -> aperçu déjà vu (persisté)
+        self._pending = {}         # id_conv -> tentatives restantes (envoi raté)
+        self._ignorees = set()     # id_conv où NOUS sommes l'acheteur
+        self._settled = set()      # id_conv inspectés, plus rien à répondre
+        self._echecs = {}          # id_conv -> échecs d'inspection consécutifs
+        self._load_state()
+
+    # ── État persistant ──────────────────────────────────────────────────────
+
+    def _load_state(self):
+        """Recharge les aperçus déjà vus (survit aux redémarrages)."""
+        try:
+            with open(_STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            previews = data.get("previews") or {}
+            if isinstance(previews, dict):
+                self._last_previews = {str(k): str(v) for k, v in previews.items()}
+                logger.info(f"💾 Mémoire : {len(self._last_previews)} aperçu(s) déjà vu(s)")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Mémoire illisible ({e}) → on repart de zéro.")
+
+    def _save_state(self):
+        try:
+            with open(_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"previews": self._last_previews}, f,
+                          ensure_ascii=False, indent=0)
+        except Exception as e:
+            logger.debug(f"Sauvegarde de la mémoire impossible : {e}")
+
+    def _trim_state(self, garde: int = 400):
+        """Borne la taille de la mémoire (dict ordonné → on oublie les anciens)."""
+        if len(self._last_previews) > garde * 1.5:
+            for k in list(self._last_previews)[:len(self._last_previews) - garde]:
+                del self._last_previews[k]
 
     # ── Démarrage ────────────────────────────────────────────────────────────
 
@@ -290,12 +338,15 @@ class LeboncoinClient:
             await self.close()
         except Exception:
             pass
-        # Réinitialise l'état volatil (le serveur redevient la source de vérité)
+        # Réinitialise l'état VOLATIL seulement : la mémoire des aperçus reste
+        # valable (elle est persistée), inutile de tout re-parcourir.
         self._shutdown = False
         self._is_cdp = False
         self._current_thread_url = None
-        self._last_previews.clear()
-        self._answered.clear()
+        self._pending.clear()
+        self._ignorees.clear()
+        self._settled.clear()
+        self._echecs.clear()
         try:
             await self.start()
             return True
@@ -471,6 +522,55 @@ class LeboncoinClient:
 
     # ── Lecture des messages ─────────────────────────────────────────────────
 
+    def _candidats(self, items: list) -> list:
+        """Fils qu'il est LÉGITIME d'ouvrir, d'après la liste seule.
+
+        Ouvrir un fil recharge une page et le marque « lu » côté serveur :
+        on n'ouvre donc QUE s'il y a une raison.
+
+          • l'aperçu a changé (ou n'a jamais été vu) → nouveau message ;
+          • le fil est non lu et jamais inspecté depuis le démarrage ;
+          • une réponse est en attente (envoi raté) → on retente, mais un
+            nombre de fois BORNÉ (sinon un fil cassé boucle à l'infini).
+
+        Tout le reste est laissé tranquille : c'est ce qui évite de relire
+        en boucle les conversations déjà traitées.
+        """
+        todo = []
+        for it in items:
+            href = it["href"]
+            id_conv = href.rstrip("/").split("/")[-1]
+            preview = it["preview"]
+
+            change = self._last_previews.get(href) != preview
+            self._last_previews[href] = preview   # vu, quel que soit le sort
+
+            if id_conv in self._ignorees:
+                continue                          # on est l'acheteur ici
+
+            if id_conv in self._pending:
+                if self._pending[id_conv] >= MAX_TENTATIVES:
+                    logger.warning(
+                        f"⚠️ Conv {id_conv} : {MAX_TENTATIVES} tentatives sans "
+                        f"succès → abandonnée (elle reste dans la liste)."
+                    )
+                    del self._pending[id_conv]
+                    self._settled.add(id_conv)
+                    continue
+                self._pending[id_conv] += 1
+                logger.debug(f"🔁 Conv {id_conv} : réponse en attente, nouvelle tentative")
+                todo.append(it)
+            elif change:
+                todo.append(it)
+            elif it["unread"] and id_conv not in self._settled:
+                todo.append(it)
+            else:
+                logger.debug(f"⏭️ Conv {id_conv} : rien de nouveau, fil non ouvert")
+
+        self._trim_state()
+        self._save_state()
+        return todo
+
     async def get_new_messages(self) -> list:
         """Renvoie les conversations dont le DERNIER message vient de l'acheteur."""
         from config import MAX_CONVS_PER_SCAN
@@ -501,20 +601,12 @@ class LeboncoinClient:
         nb_non_lues = sum(1 for it in items if it["unread"])
         logger.info(f"📬 {len(items)} conversation(s), {nb_non_lues} non lue(s)")
 
-        # Candidats : non-lus, aperçu modifié/jamais vu, ou fil auquel on n'a
-        # pas encore répondu. `_answered` n'empêche PAS de détecter un aperçu
-        # modifié (un nouveau message sans badge doit rester visible).
-        todo = []
-        for it in items:
-            id_conv = it["href"].rstrip("/").split("/")[-1]
-            if it["unread"]:
-                self._answered.discard(id_conv)
-            preview_changed = (
-                it["href"] not in self._last_previews
-                or self._last_previews[it["href"]] != it["preview"]
-            )
-            if it["unread"] or preview_changed or id_conv not in self._answered:
-                todo.append(it)
+        todo = self._candidats(items)
+        if not todo:
+            logger.info("😴 Rien à inspecter (aucun aperçu modifié, aucune non lue).")
+            return []
+
+        logger.info(f"🔎 {len(todo)} fil(s) à inspecter sur {len(items)}")
 
         max_inspect = MAX_CONVS_PER_SCAN + 3
         inspected = 0
@@ -539,13 +631,23 @@ class LeboncoinClient:
             thread = await self._read_thread(conv_url)
 
             if thread is None:
+                # Fil illisible (captcha, lien absent…). On retente, mais pas
+                # indéfiniment : au-delà il sera considéré comme réglé.
+                self._echecs[id_conv] = self._echecs.get(id_conv, 0) + 1
+                if self._echecs[id_conv] >= MAX_TENTATIVES:
+                    logger.warning(f"⚠️ Conv {id_conv} illisible {MAX_TENTATIVES}× "
+                                   f"→ ignorée désormais.")
+                    self._settled.add(id_conv)
                 continue
+            self._echecs.pop(id_conv, None)
 
             # Conversation où NOUS sommes l'acheteur (« À propos de ce vendeur ») :
-            # le bot ne doit jamais répondre à la place du vendeur d'une AUTRE annonce.
+            # le bot ne doit jamais répondre à la place du vendeur d'une AUTRE
+            # annonce — et ne doit plus jamais la rouvrir.
             if thread.get("counterpart") == "vendeur":
-                logger.info(f"⏭️ Conv {id_conv} : nous sommes l'acheteur → ignorée.")
-                self._last_previews[href] = it["preview"]
+                logger.info(f"⏭️ Conv {id_conv} : nous sommes l'acheteur → ignorée pour de bon.")
+                self._ignorees.add(id_conv)
+                self._pending.pop(id_conv, None)
                 continue
 
             # Pré-réponses proposées par leboncoin (facultatives) : on les trace.
@@ -565,18 +667,21 @@ class LeboncoinClient:
                 )
 
             if thread.get("lastSide") == "out":
-                logger.debug(f"⏭️ Dernier message = nous, conv ignorée ({id_conv})")
-                self._last_previews[href] = it["preview"]
+                logger.debug(f"⏭️ Dernier message = nous, conv réglée ({id_conv})")
+                self._settled.add(id_conv)
+                self._pending.pop(id_conv, None)
                 continue
 
             texte = thread.get("buyersText")
             if not texte:
                 logger.debug(f"⏭️ Fil sans message d'acheteur ({id_conv})")
-                self._last_previews[href] = it["preview"]
+                self._settled.add(id_conv)
+                self._pending.pop(id_conv, None)
                 continue
 
-            # ⚠️ On NE marque PAS ce fil comme « vu » ici : s'il est renvoyé comme
-            # candidat puis que l'envoi échoue, il doit être retenté au scan suivant.
+            # Réponse à produire : elle reste « en attente » jusqu'à ce que
+            # l'envoi soit confirmé (send_message la retire de _pending).
+            self._pending.setdefault(id_conv, 0)
 
             conversations.append({
                 "id_conv": id_conv,
@@ -587,6 +692,7 @@ class LeboncoinClient:
             })
             logger.info(f"💬 Conv {id_conv}: {texte[:80]}…")
 
+        self._save_state()
         return conversations
 
     async def _read_thread(self, conv_url: str, tries: int = 6):
@@ -715,7 +821,8 @@ class LeboncoinClient:
 
             sent = await self._verify_sent(texte, prev_count)
             if sent:
-                self._answered.add(id_conv)
+                self._pending.pop(id_conv, None)
+                self._settled.add(id_conv)
                 logger.info(f"Message envoyé ✅ conv {id_conv}")
             else:
                 logger.warning(f"⚠️ Conv {id_conv} : envoi non confirmé")

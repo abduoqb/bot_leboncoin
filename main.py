@@ -9,12 +9,16 @@ from datetime import datetime, timedelta
 from config import (
     SCAN_MIN, SCAN_MAX, NIGHT_START_HOUR, NIGHT_END_HOUR, MAX_HISTORY,
     PROMPTS, REPONSES_STATIQUES, BASE_PERSONA, MAX_CONVS_PER_SCAN, BASE_DIR,
+    NOMS_A_NEUTRALISER, VENTE,
 )
 
 from conversation import ConversationManager
 from llm import generate_reply, classify_message, init_session, close_session
 from leboncoin import LeboncoinClient
-from rules import is_closing, is_manipulation, REPONSE_CLOSING
+from rules import (
+    is_closing, is_manipulation, is_disponibilite, reponse_disponibilite,
+    REPONSE_CLOSING, sanitize_reply,
+)
 
 # ── Logging (Bug 16: rotation 5Mo x 3 fichiers) ─────────
 # Windows : la console est en cp1252 et ferait planter tout log contenant un
@@ -84,12 +88,18 @@ async def process() -> bool:
         # 1) Injection de prompt : enjeu de sécurité → jamais délégué au modèle.
         # 2) Formule de conclusion (« merci, bonne journée ») : le LLM y colle
         #    presque toujours une relance commerciale, on répond en dur.
+        # 3) Disponibilité de l'article : donnée vérifiée, le modèle l'a déjà
+        #    contredite (« Non, elle n'est plus disponible »). Réponse en dur.
         if is_manipulation(texte):
             reponse = REPONSES_STATIQUES["manipulation"]
             logger.info("🛡️ Injection de prompt détectée → réponse figée (0 appel LLM).")
         elif is_closing(texte):
             reponse = REPONSE_CLOSING
             logger.info("🧷 Conclusion détectée → réponse figée (0 appel LLM).")
+        elif is_disponibilite(texte):
+            reponse = reponse_disponibilite(
+                VENTE.get("disponibilite_confirmee"), VENTE.get("ville"))
+            logger.info("📦 Question de disponibilité → réponse figée (0 appel LLM).")
         else:
             # ── ROUTER (Appel 1) ──
             categorie = await classify_message(texte)
@@ -107,6 +117,17 @@ async def process() -> bool:
                 # L'historique est stocké avec un persona neutre, on remplace ensuite
                 context, nb_envois = await db.build_context(
                     id_conv, texte, BASE_PERSONA, MAX_HISTORY)
+
+                # Assainir l'historique réinjecté : d'anciennes réponses fautives
+                # (« Bonjour Monsieur Co, ... ») sont en base et le modèle les
+                # recopierait. On ne modifie pas la base, on nettoie à la lecture.
+                for m in context[1:-1]:
+                    if m.get("role") == "assistant":
+                        m["content"] = sanitize_reply(
+                            m["content"], has_history=True,
+                            noms=NOMS_A_NEUTRALISER,
+                        )
+
                 # Remplacer le system prompt par le mini-prompt spécialisé du tour actuel
                 context[0]["content"] = system_prompt
                 info_envois = (
@@ -117,6 +138,18 @@ async def process() -> bool:
 
                 # Génération LLM
                 reponse = await generate_reply(context)
+
+                # Garde-fou déterministe : aucun nom de personne, une seule
+                # salutation par conversation (un modèle 4B ne tient pas la
+                # consigne tout seul).
+                if reponse:
+                    propre = sanitize_reply(
+                        reponse, has_history=nb_envois > 0,
+                        noms=NOMS_A_NEUTRALISER,
+                    )
+                    if propre != reponse:
+                        logger.info(f"🧽 Réponse nettoyée (nom/salutation) : {propre[:80]}…")
+                    reponse = propre
 
                 # Repli : une pré-réponse proposée par leboncoin (le cas échéant)
                 if not reponse:
