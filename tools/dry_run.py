@@ -40,7 +40,7 @@ from llm import classify_message, generate_reply, init_session, close_session  #
 from leboncoin import LeboncoinClient  # noqa: E402
 from rules import (  # noqa: E402
     is_closing, is_manipulation, is_disponibilite, reponse_disponibilite,
-    REPONSE_CLOSING, sanitize_reply,
+    corrige_offre, ligne_decision_offre, REPONSE_CLOSING, sanitize_reply,
 )
 
 
@@ -91,10 +91,20 @@ async def main():
                             h["content"], has_history=True,
                             noms=NOMS_A_NEUTRALISER)
                 ctx[0]["content"] = PROMPTS.get(cat, PROMPTS["general"])
+                if cat == "negociation":
+                    decision = ligne_decision_offre(m["texte"], VENTE)
+                    if decision:
+                        ctx[0]["content"] += "\n\n" + decision
+                        print(f"  🧮 {decision}")
                 rep = await generate_reply(ctx)
                 if rep:
                     rep = sanitize_reply(
                         rep, has_history=nb > 0, noms=NOMS_A_NEUTRALISER)
+                if rep and cat == "negociation":
+                    fix = corrige_offre(rep, m["texte"], VENTE)
+                    if fix:
+                        print("  🛡️ décision chiffrée reprise en main")
+                        rep = fix
                 print(f"  RÉPONSE (LLM) : {rep}")
 
         print(f"\n{'=' * 70}\n  Test à blanc terminé — AUCUN message n'a été envoyé.\n{'=' * 70}")

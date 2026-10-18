@@ -10,6 +10,31 @@ logger = logging.getLogger(__name__)
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def fil_vers_historique(bulles, retire_fin_acheteur: bool = True) -> list:
+    """Convertit les bulles d'un fil (JS_THREAD) en historique de conversation.
+
+    `side` vaut « in » (acheteur) ou « out » (nous). On retire la suite finale
+    de messages de l'acheteur : c'est le message auquel on va répondre, il est
+    déjà passé au LLM séparément (sinon il compterait deux fois).
+    """
+    bulles = list(bulles or [])
+    if retire_fin_acheteur:
+        while bulles and bulles[-1].get("side") == "in":
+            bulles.pop()
+    return [
+        {"role": "assistant" if b.get("side") == "out" else "user",
+         "content": (b.get("text") or "").strip()}
+        for b in bulles
+        if (b.get("text") or "").strip()
+    ]
+
+
+def _meme_message(a: dict, b: dict) -> bool:
+    return (a.get("role") == b.get("role")
+            and (a.get("content") or "").strip() == (b.get("content") or "").strip())
+
+
+
 class _SyncConversationManager:
     """Gestionnaire synchrone SQLite (ne pas utiliser directement)."""
 
@@ -71,11 +96,43 @@ class _SyncConversationManager:
         except sqlite3.Error as e:
             logger.error(f"Erreur SQLite save_message({id_lbc}): {e}")
 
-    def build_context(self, id_lbc: str, new_message: str, system_prompt: str, max_hist: int = 8) -> tuple:
-        messages, nb_envois = self.get_messages(id_lbc)
-        history = messages[-max_hist:]
+    def build_context(self, id_lbc: str, new_message: str, system_prompt: str,
+                      max_hist: int = 8, fil: list = None) -> tuple:
+        """Construit le contexte envoyé au LLM.
+
+        LE FIL LU DANS LA PAGE FAIT FOI (`fil`, issu de JS_THREAD) : il contient
+        la réalité — messages envoyés à la main, avant l'installation du bot,
+        ou conversations que la base n'a jamais vues. La base ne sert qu'à
+        deux choses :
+          • compléter les messages plus anciens que la page n'affiche plus
+            (la page ne rend que les derniers) ;
+          • garder la trace qui permet l'anti-doublon.
+
+        Elle reste donc utile, mais elle n'est plus la source de vérité du
+        contexte : une base incomplète ou contenant d'anciennes réponses
+        fautives ne peut plus polluer la réponse.
+        """
+        messages, nb_envois_db = self.get_messages(id_lbc)
+        fil = fil or []
+
+        if not fil:
+            complet = messages              # pas de fil lisible → base seule
+        else:
+            # Recoller les messages plus anciens : on aligne la base sur le
+            # premier message du fil et on ne garde que ce qui précède.
+            prefixe = []
+            if messages:
+                idx = next((i for i in range(len(messages))
+                            if _meme_message(messages[i], fil[0])), None)
+                if idx is not None:
+                    prefixe = messages[:idx]
+            complet = prefixe + fil
+
+        nb_envois = max(nb_envois_db,
+                        sum(1 for m in complet if m.get("role") == "assistant"))
+
         context = [{"role": "system", "content": system_prompt}]
-        context += history
+        context += complet[-max_hist:]
         context.append({"role": "user", "content": new_message})
         return context, nb_envois
 
@@ -104,8 +161,10 @@ class ConversationManager:
     async def save_message(self, id_lbc: str, role: str, content: str):
         await asyncio.to_thread(self._sync.save_message, id_lbc, role, content)
 
-    async def build_context(self, id_lbc: str, new_message: str, system_prompt: str, max_hist: int = 8) -> tuple:
-        return await asyncio.to_thread(self._sync.build_context, id_lbc, new_message, system_prompt, max_hist)
+    async def build_context(self, id_lbc: str, new_message: str, system_prompt: str,
+                            max_hist: int = 8, fil: list = None) -> tuple:
+        return await asyncio.to_thread(self._sync.build_context, id_lbc, new_message,
+                                       system_prompt, max_hist, fil)
 
     async def close(self):
         await asyncio.to_thread(self._sync.close)

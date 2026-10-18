@@ -40,6 +40,8 @@ from conversation import ConversationManager  # noqa: E402
 from llm import classify_message, generate_reply, init_session, close_session  # noqa: E402
 from rules import (  # noqa: E402
     is_closing, is_manipulation, is_disponibilite, reponse_disponibilite,
+    accepte_sous_le_plancher, corrige_offre, offre_chiffree,
+    reponse_contre_offre, ligne_decision_offre,
     REPONSE_CLOSING, sanitize_reply,
 )
 
@@ -88,6 +90,20 @@ DISPO_CASES = [
     ("Est-ce que je peux mettre des jeux en disque dedans ?", False),
 ]
 
+# Vérifications déterministes du nettoyage : (texte, a un historique ?, attendu)
+SANITIZE_CASES = [
+    ("Bonjour Monsieur Co, la PS5 est disponible.", True,
+     "La PS5 est disponible."),
+    ("Bonjour Raphaël Co, la PS5 est toujours disponible.", False,
+     "Bonjour, la PS5 est toujours disponible."),
+    ("Bonjour, oui c'est négociable. Faites-moi votre meilleure offre.", True,
+     "Oui c'est négociable. Faites-moi votre meilleure offre."),
+    ("Bonne journée à vous également.", True,
+     "Bonne journée à vous également."),
+    ("De quoi avez-vous besoin exactement?", True,
+     "De quoi avez-vous besoin exactement\u00a0?"),
+]
+
 # Cas avec historique : c'est là que le bot se répétait (« Bonjour » à chaque
 # message) et ressortait le nom du compte vendeur. (historique, message, catégorie)
 HISTORY_CASES = [
@@ -134,18 +150,61 @@ HISTORY_CASES = [
     ),
 ]
 
-# Vérifications purement déterministes du nettoyage (0 appel LLM).
-SANITIZE_CASES = [
-    ("Bonjour Monsieur Co, la PS5 est disponible.", True,
-     "La PS5 est disponible."),
-    ("Bonjour Raphaël Co, la PS5 est toujours disponible.", False,
-     "Bonjour, la PS5 est toujours disponible."),
-    ("Bonjour, oui c'est négociable. Faites-moi votre meilleure offre.", True,
-     "Oui c'est négociable. Faites-moi votre meilleure offre."),
-    ("Bonne journée à vous également.", True,
-     "Bonne journée à vous également."),
-    ("De quoi avez-vous besoin exactement?", True,
-     "De quoi avez-vous besoin exactement\u00a0?"),
+# Vérifications du garde-fou « prix plancher » (0 appel LLM).
+# (réponse du modèle, message acheteur, doit être bloquée ?)
+PLANCHER_CASES = [
+    # Acceptation SANS montant alors que l'acheteur est sous le plancher → bloqué
+    ("D'accord, je vous la laisse.", "je peux monter a 370€", True),
+    ("Ça marche pour moi.", "je vous en propose 360", True),
+    # Acceptation qui cite un montant SOUS le plancher → bloqué
+    ("D'accord, à 370 € ça me va.", "je vous en propose 370", True),
+    # Acceptation AU-DESSUS du plancher → laissée telle quelle
+    ("D'accord, à 400 € ça me va.", "je vous en propose 400", False),
+    ("D'accord, à 420 € ça me va.", "je vous en propose 420", False),
+    ("Ça marche.", "je vous en propose 400", False),
+    # Contre-offre (un montant plus haut est cité) → légitime, jamais bloquée
+    ("Merci. À 430 € je vous la laisse.", "je peux monter a 370€", False),
+    # Pas d'acceptation → rien à bloquer
+    ("C'est un peu juste pour moi.", "je vous en propose 360", False),
+    # Faux positifs de lecture de nombres : aucun montant réel
+    ("Oui, samedi 18h c'est parfait.", "je peux passer samedi 18h ?", False),
+    ("Je vous la laisse, on se voit samedi.", "samedi 20h30 vous êtes là ?", False),
+]
+
+# Décision chiffrée : (message acheteur, montant à annoncer ou None)
+OFFRE_CASES = [
+    ("je vous en propose 360", 430),
+    ("Je vous ai propose 360 je peux monter a 370€", 430),
+    ("Je vous ai fais une proposition à 400€ en espèces", 400),
+    ("400 € et je viens ce soir", 400),
+    ("je peux mettre 450", 450),
+    # Pas d'intention d'offre → le modèle reste seul juge
+    ("Vous l'avez achetée 400 € ?", None),
+    ("je peux passer samedi 18h ?", None),
+    ("Elle est toujours disponible ?", None),
+]
+
+# Correction après génération : (réponse du modèle, message acheteur, attendu,
+# None = on garde la réponse du modèle telle quelle)
+CORRIGE_CASES = [
+    # Le modèle recopie l'historique au lieu d'accepter une offre au prix
+    ("Bonne journée à vous également.",
+     "Je vous ai fais une proposition à 400€ en espèces",
+     "Merci, à 400 € ça me va."),
+    # …mais une acceptation correcte est conservée
+    ("Merci, à 400 € ça me va.",
+     "Je vous ai fais une proposition à 400€ en espèces", None),
+    # Le modèle annonce le plancher au lieu de la contre-offre
+    ("Merci, à 400 € ça me va.", "je peux monter a 370€",
+     "Merci pour votre offre. À 430 € je vous la laisse."),
+    # …et une contre-offre correcte est conservée
+    ("Merci pour votre offre. À 430 € je vous la laisse.",
+     "je peux monter a 370€", None),
+    # Acceptation sous le plancher sans montant cité
+    ("D'accord, je vous la laisse.", "je vous en propose 360",
+     "Merci pour votre offre. À 430 € je vous la laisse."),
+    # Aucune offre dans le message : on ne touche à rien
+    ("Oui, samedi c'est possible.", "Je peux passer samedi ?", None),
 ]
 
 
@@ -169,6 +228,50 @@ def _check_dispo():
         good = got == attendu
         ok += good
         print(f"  {'✅' if good else '⚠️ '} {texte!r} → règle={got} (attendu {attendu})")
+    return ok
+
+
+def _check_plancher():
+    """Garde-fou « jamais vendre sous le plancher » (0 appel LLM)."""
+    ok = 0
+    for rep, msg, doit_bloquer in PLANCHER_CASES:
+        bloque = accepte_sous_le_plancher(rep, msg, VENTE)
+        good = bloque == doit_bloquer
+        ok += good
+        verdict = "bloquée" if bloque else "laissée"
+        att = "bloquée" if doit_bloquer else "laissée"
+        print(f"  {'✅' if good else '⚠️ '} {rep!r}")
+        print(f"     ← {msg!r} → {verdict} (attendu {att})")
+    return ok
+
+
+def _check_offre():
+    """Décision chiffrée : offres acceptées ou contre-offertes (0 appel LLM)."""
+    ok = 0
+    for msg, attendu in OFFRE_CASES:
+        d = offre_chiffree(msg, VENTE)
+        got = d[1] if d else None
+        good = got == attendu
+        ok += good
+        print(f"  {'✅' if good else '⚠️ '} {msg!r} → annonce {got} "
+              f"(attendu {attendu})")
+        if d and d[1] not in (None, d[0]):
+            print(f"     contre-offre : {reponse_contre_offre(VENTE)}")
+    return ok
+
+
+def _check_corrige():
+    """Correction après génération (0 appel LLM)."""
+    ok = 0
+    for rep, msg, attendu in CORRIGE_CASES:
+        got = corrige_offre(rep, msg, VENTE)
+        good = got == attendu
+        ok += good
+        print(f"  {'✅' if good else '⚠️ '} {rep!r}")
+        print(f"     ← {msg!r}")
+        print(f"     → {got!r}")
+        if not good:
+            print(f"     attendu {attendu!r}")
     return ok
 
 
@@ -220,12 +323,24 @@ async def _repondre(msg, history=None):
             f"\n\n[INFO INTERNE: Tu as déjà échangé {nb} message(s) "
             f"avec cet acheteur. Réponds au dernier message.]"
         )
+    if cat == "negociation":
+        decision = ligne_decision_offre(msg, VENTE)
+        if decision:
+            sys_prompt += "\n\n" + decision
+            print(f"    🧮 {decision}")
 
     ctx = [{"role": "system", "content": sys_prompt}] + hist
     ctx.append({"role": "user", "content": msg})
     rep = await generate_reply(ctx)
     if rep:
         rep = sanitize_reply(rep, has_history=has_history, noms=NOMS_A_NEUTRALISER)
+    # Même garde-fou que main.py : sur un montant, on ne laisse pas le modèle
+    # se tromper (acceptation sous le plancher, réponse à côté, mauvais chiffre).
+    if rep and cat == "negociation":
+        fix = corrige_offre(rep, msg, VENTE)
+        if fix:
+            print("    🛡️ décision chiffrée reprise en main")
+            rep = fix
     return cat, rep
 
 
@@ -267,6 +382,12 @@ async def main():
         print(f"  → nettoyage : {ok_san}/{len(SANITIZE_CASES)} corrects")
         ok_dispo = _check_dispo()
         print(f"  → disponibilité : {ok_dispo}/{len(DISPO_CASES)} corrects")
+        ok_plancher = _check_plancher()
+        print(f"  → garde-fou prix plancher : {ok_plancher}/{len(PLANCHER_CASES)} corrects")
+        ok_offre = _check_offre()
+        print(f"  → décision chiffrée : {ok_offre}/{len(OFFRE_CASES)} corrects")
+        ok_corrige = _check_corrige()
+        print(f"  → correction d'offre : {ok_corrige}/{len(CORRIGE_CASES)} corrects")
 
         for i, (msg, attendu) in enumerate(CASES):
             if only is not None and i != only:

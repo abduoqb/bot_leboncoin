@@ -12,12 +12,12 @@ from config import (
     NOMS_A_NEUTRALISER, VENTE,
 )
 
-from conversation import ConversationManager
+from conversation import ConversationManager, fil_vers_historique
 from llm import generate_reply, classify_message, init_session, close_session
 from leboncoin import LeboncoinClient
 from rules import (
     is_closing, is_manipulation, is_disponibilite, reponse_disponibilite,
-    REPONSE_CLOSING, sanitize_reply,
+    corrige_offre, ligne_decision_offre, REPONSE_CLOSING, sanitize_reply,
 )
 
 # ── Logging (Bug 16: rotation 5Mo x 3 fichiers) ─────────
@@ -113,10 +113,17 @@ async def process() -> bool:
                 # Récupérer le mini-prompt spécialisé
                 system_prompt = PROMPTS.get(categorie, PROMPTS["general"])
 
-                # Construire le contexte avec BASE_PERSONA (Bug 5 : cohérence historique)
-                # L'historique est stocké avec un persona neutre, on remplace ensuite
+                # Construire le contexte : le FIL LU DANS LA PAGE est prioritaire
+                # (il contient la réalité, y compris les messages envoyés à la
+                # main) ; la base ne complète que les messages plus anciens.
+                hist_fil = fil_vers_historique(msg.get("messages"))
+                if msg.get("fil_tronque"):
+                    logger.info("📜 Le fil affiché est tronqué → la base complète "
+                                "l'historique plus ancien.")
                 context, nb_envois = await db.build_context(
-                    id_conv, texte, BASE_PERSONA, MAX_HISTORY)
+                    id_conv, texte, BASE_PERSONA, MAX_HISTORY, fil=hist_fil)
+                logger.info(f"🧠 Contexte : {len(hist_fil)} message(s) lu(s) dans la "
+                            f"page, {len(context) - 1 - len(hist_fil)} de la base.")
 
                 # Assainir l'historique réinjecté : d'anciennes réponses fautives
                 # (« Bonjour Monsieur Co, ... ») sont en base et le modèle les
@@ -136,6 +143,15 @@ async def process() -> bool:
                 )
                 context[0]["content"] += info_envois
 
+                # Décision chiffrée interne (offre de l'acheteur) : c'est le
+                # calcul que le modèle rate (plancher confondu avec la
+                # contre-offre). On la lui donne déjà tranchée.
+                if categorie == "negociation":
+                    decision = ligne_decision_offre(texte, VENTE)
+                    if decision:
+                        context[0]["content"] += "\n\n" + decision
+                        logger.info(f"🧮 {decision}")
+
                 # Génération LLM
                 reponse = await generate_reply(context)
 
@@ -150,6 +166,16 @@ async def process() -> bool:
                     if propre != reponse:
                         logger.info(f"🧽 Réponse nettoyée (nom/salutation) : {propre[:80]}…")
                     reponse = propre
+
+                # Décision chiffrée : sur un montant, on ne laisse pas le modèle
+                # se tromper (il a déjà accepté sous le plancher, et recopié
+                # l'historique au lieu d'accepter une offre au prix).
+                if reponse and categorie == "negociation":
+                    fix = corrige_offre(reponse, texte, VENTE)
+                    if fix:
+                        logger.warning(
+                            f"🛡️ Décision chiffrée reprise en main : {fix[:70]}…")
+                        reponse = fix
 
                 # Repli : une pré-réponse proposée par leboncoin (le cas échéant)
                 if not reponse:

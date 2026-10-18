@@ -201,6 +201,12 @@ JS_THREAD = r"""() => {
     lastText: last ? last.text : null,
     buyersText: (last && last.side === 'in' && trailingIn.length)
       ? trailingIn.join('\n') : null,
+    // Le fil complet, dans l'ordre : c'est LUI qui fait foi pour le contexte
+    // (il contient les messages envoyés à la main, que la base ignore).
+    messages: all.slice(-40),
+    // La page n'affiche que les derniers messages : au-delà, la base complète.
+    hasMoreAbove: container
+      ? (container.scrollHeight > container.clientHeight + 40) : false,
     hasOffer,
     counterpart,
     quickReplies: quickReplies.slice(0, 5),
@@ -689,6 +695,8 @@ class LeboncoinClient:
                 "texte": texte,
                 "unread": it["unread"],
                 "quick_replies": thread.get("quickReplies") or [],
+                "messages": thread.get("messages") or [],
+                "fil_tronque": bool(thread.get("hasMoreAbove")),
             })
             logger.info(f"💬 Conv {id_conv}: {texte[:80]}…")
 

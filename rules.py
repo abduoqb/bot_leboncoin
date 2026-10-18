@@ -145,7 +145,183 @@ def reponse_disponibilite(dispo, ville: str | None = None) -> str:
     return "Laissez-moi vérifier et je vous confirme ça rapidement."
 
 
-# ── 4. Neutralisation des noms de personnes et des salutations ───────────────
+# ── 4. Offres chiffrées : décision déterministe ─────────────────────────────
+#
+# Comparer deux nombres et ne pas se tromper de référence (plancher vs
+# contre-offre) est exactement ce qu'un modèle 4B rate : à une offre de
+# 370 € il a répondu « à 400 € ça me va », soit le plancher au lieu de la
+# contre-offre à 430 €. La décision est donc prise ici, en dur, et le modèle
+# ne fait que la formuler.
+
+# Un montant : 2 à 4 chiffres, éventuellement suivi d'une devise. On exclut
+# ce qui est collé à une unité de temps (« 18h », « 20h30 », « 3 ans »).
+_MONTANT_RE = re.compile(
+    r"(?<!\d)(\d{2,4})(?!\d)\s*(?:€|euros?|eur|balles?)?"
+    r"(?!\s*(?:h|h\d|min|mn|ans?|mois|jours?|semaines?|fois|km|go|to))",
+    re.IGNORECASE,
+)
+
+# « Oui » du vendeur (à distinguer d'une contre-offre, qui cite un montant).
+_ACCEPTATION_RE = re.compile(
+    r"\b(d'?accord|c'?est d'?accord|ça marche|ca marche|c'?est bon pour moi|"
+    r"je vous la laisse|je vous la c[èe]de|je vous la vends|je la vends|"
+    r"march[ée] conclu|on est d'?accord|banco|je suis d'?accord|"
+    r"c'?est entendu|ok pour moi|ça me va|ca me va|parfait pour moi)\b",
+    re.IGNORECASE,
+)
+
+# Une VRAIE intention d'offre. Sans ce signal, un montant trouvé dans le
+# message peut être autre chose (une question sur le prix d'achat, un
+# créneau, une quantité…) : on ne tranche pas à la place du modèle.
+_CUE_OFFRE_RE = re.compile(
+    r"(je\s+(?:vous\s+)?(?:en\s+)?(?:propose|donne|offre|met|mets|paie|paye)|"
+    r"j'?(?:en\s+)?(?:propose|donne|offre)|"
+    r"je\s+peux\s+(?:monter|mettre|aller)|"
+    r"ma\s+proposition|mon\s+offre|mon\s+budget|"
+    r"je\s+viens|je\s+la\s+prends|"
+    r"on\s+fait|on\s+dit|vous\s+me\s+la|"
+    r"d'?accord\s+pour|"
+    r"billets?|cash|esp[èe]ces|"
+    r"\b(?:à|a|pour)\s+\d{2,4}\s*(?:€|euros?))",
+    re.IGNORECASE,
+)
+
+
+def bornes_montant(vente: dict) -> tuple:
+    """Plage de montants plausibles pour CETTE vente (évite les faux positifs).
+
+    Bornes larges autour des prix connus : en dessous, il s'agit presque
+    toujours d'autre chose (un créneau, une quantité, une année…).
+    """
+    refs = [v for v in (vente.get("prix_plancher_eur"),
+                        vente.get("prix_affiche_eur"))
+            if isinstance(v, (int, float))]
+    if not refs:
+        return 50, 100_000
+    return int(min(refs) * 0.5), int(max(refs) * 1.6)
+
+
+def montants(text: str, mini: int, maxi: int) -> list:
+    """Montants plausibles (dans [mini, maxi]) trouvés dans un texte."""
+    if not text:
+        return []
+    return [int(m.group(1)) for m in _MONTANT_RE.finditer(text)
+            if mini <= int(m.group(1)) <= maxi]
+
+
+def _fmt(montant) -> str:
+    return f"{montant:g}"
+
+
+def offre_chiffree(texte: str, vente: dict):
+    """Décision sur une offre chiffrée : (montant proposé, montant à annoncer).
+
+    Le second vaut :
+      • le montant proposé  → on accepte (offre ≥ prix plancher) ;
+      • la contre-offre     → on la propose (offre < plancher) ;
+      • None                → on refuse poliment, sans avancer de chiffre.
+
+    Retourne None si le message ne contient pas d'offre chiffrée claire.
+    """
+    plancher = vente.get("prix_plancher_eur")
+    if not isinstance(plancher, (int, float)):
+        return None
+    if not _CUE_OFFRE_RE.search(texte or ""):
+        return None
+    mini, maxi = bornes_montant(vente)
+    offres = montants(texte, mini, maxi)
+    if not offres:
+        return None
+    offre = max(offres)
+    if offre >= plancher:
+        return offre, offre
+    contre = vente.get("prix_contre_offre_eur")
+    if isinstance(contre, (int, float)) and contre:
+        return offre, contre
+    return offre, None
+
+
+def ligne_decision_offre(texte: str, vente: dict) -> str | None:
+    """Consigne interne donnée au modèle pour qu'il ne se trompe pas de chiffre."""
+    d = offre_chiffree(texte, vente)
+    if not d:
+        return None
+    offre, cible = d
+    if cible is None:
+        return (f"[DÉCISION INTERNE: l'acheteur propose {_fmt(offre)} €, c'est "
+                f"en dessous de ton prix minimum. Refuse ce montant sans écrire "
+                f"aucun chiffre de ton côté.]")
+    if cible == offre:
+        return (f"[DÉCISION INTERNE: l'acheteur propose {_fmt(offre)} €, tu "
+                f"ACCEPTES ce montant. Écris ce chiffre, et rien d'autre : pas "
+                f"de réservation, pas de paiement, pas de rendez-vous.]")
+    return (f"[DÉCISION INTERNE: l'acheteur propose {_fmt(offre)} €, c'est en "
+            f"dessous de ton prix minimum. Tu proposes {_fmt(cible)} € et tu "
+            f"n'écris AUCUN autre montant.]")
+
+
+def reponse_contre_offre(vente: dict) -> str:
+    """Repli sûr (et naturel) quand il faut répondre à une offre trop basse."""
+    contre = vente.get("prix_contre_offre_eur")
+    if isinstance(contre, (int, float)) and contre:
+        return f"Merci pour votre offre. À {_fmt(contre)} € je vous la laisse."
+    return ("Merci pour votre offre. C'est un peu juste pour moi, mais je "
+            "reste ouvert si vous pouvez monter un peu.")
+
+
+def accepte_sous_le_plancher(reponse: str, texte_acheteur: str, vente: dict) -> bool:
+    """La réponse accepte-t-elle un prix INFÉRIEUR au prix plancher ?
+
+    C'est l'erreur la plus coûteuse du bot : on ne la laisse pas à un modèle.
+    Le prix accepté est le montant cité dans la réponse, sinon l'offre la plus
+    haute de l'acheteur. On ne juge que si la réponse dit « oui » ET qu'un
+    montant est identifiable.
+    """
+    plancher = vente.get("prix_plancher_eur")
+    if not reponse or not texte_acheteur or not isinstance(plancher, (int, float)):
+        return False
+    if not _ACCEPTATION_RE.search(reponse):
+        return False
+    mini, maxi = bornes_montant(vente)
+    prix = montants(reponse, mini, maxi) or montants(texte_acheteur, mini, maxi)
+    return bool(prix) and max(prix) < plancher
+
+
+def reponse_offre(offre, cible, vente: dict) -> str:
+    """Réponse déterministe à une offre chiffrée."""
+    if cible is not None and cible == offre:
+        return f"Merci, à {_fmt(offre)} € ça me va."
+    return reponse_contre_offre(vente)
+
+
+def corrige_offre(reponse: str, texte_acheteur: str, vente: dict):
+    """Réponse corrigée si le modèle n'a pas respecté la décision chiffrée.
+
+    Deux ratés observés en vrai, tous deux corrigés ici :
+      • il répond à côté (il recopie même la dernière ligne de l'historique)
+        au lieu d'accepter une offre au prix ou plus ;
+      • il annonce le prix plancher là où la contre-offre était attendue.
+    Retourne None quand la réponse du modèle est acceptable.
+    """
+    d = offre_chiffree(texte_acheteur or "", vente)
+    if not d:
+        # Pas d'offre clairement identifiée : on se contente d'empêcher une
+        # acceptation sous le plancher.
+        if accepte_sous_le_plancher(reponse, texte_acheteur, vente):
+            return reponse_contre_offre(vente)
+        return None
+    offre, cible = d
+    if cible is None:
+        if accepte_sous_le_plancher(reponse, texte_acheteur, vente):
+            return reponse_contre_offre(vente)
+        return None
+    mini, maxi = bornes_montant(vente)
+    if cible in montants(reponse or "", mini, maxi):
+        return None                    # le bon montant est bien annoncé
+    return reponse_offre(offre, cible, vente)
+
+
+# ── 5. Neutralisation des noms de personnes et des salutations ───────────────
 #
 # Cause observée en production : l'acheteur écrit « Bonjour Raphaël Co, votre
 # annonce m'intéresse » — « Raphaël Co » est le nom du COMPTE VENDEUR. Le

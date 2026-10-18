@@ -8,11 +8,13 @@ Bot Python qui répond automatiquement aux messages de tes annonces Leboncoin en
 
 - **Réponses naturelles et fiables** — le bot parle comme le vendeur (première personne), n'écrit jamais de nom de personne, ne salue qu'une fois par conversation, ne contredit jamais une donnée vérifiée et n'ouvre un fil que s'il y a une raison de le faire
 - **LLM local 2-étapes** — classification du message (router) puis réponse spécialisée via gemma3:4b
+- **Prix décidé en dur** — accepter une offre ou contre-proposer n'est jamais laissé au modèle : le budgétage (plancher / contre-offre) est calculé dans `rules.py`, le modèle ne fait que le formuler. Le prix plancher n'est jamais révélé
 - **Envoi réel vérifié** — le bot tape et envoie; l'envoi n'est validé que par l'apparition d'une nouvelle bulle sortante (jamais par un simple vidage de champ)
 - **Anti-détection avancée** — frappe humaine au clavier (avec fautes de frappe corrigées), mouvements de souris Bézier, scrolls naturels, navigation dispersée, pause nocturne, **aucune relecture inutile des conversations**
 - **Captcha DataDome** — tentative de glissement automatique « humain » du slider, avec repli sur intervention humaine
 - **Pré-réponses Leboncoin** — détectées, tracées, et utilisées en repli si le LLM ne produit rien
 - **Ne répond jamais à la place d'un vendeur** — les conversations où TU es l'acheteur (« À propos de ce vendeur ») sont ignorées
+- **Offres officielles Leboncoin** — le bot ne répond jamais à ce message automatique : c'est à toi de trancher (il te le signale dans les logs)
 - **Auto-relance du navigateur** — si Chrome crashe ou est fermé, le bot redémarre le profil et reprend
 - **Indépendant du répertoire courant** — profil, base et dumps sont toujours résolus depuis la racine du projet
 - **Aucun message perdu** — un envoi non confirmé est retenté au scan suivant
@@ -153,6 +155,9 @@ Message acheteur
       │     → renvoie UN mot : negociation / produit / rdv /
       │       hors_sujet / manipulation / general
       ▼
+ Si négociation avec un montant clair : décision chiffrée (rules.py)
+      │     accepter / contre-offrir, transmise au modèle déjà tranchée
+      ▼
  Appel 2 — Réponse LLM avec le mini-prompt spécialisé
       │     (ou réponse statique si hors_sujet / manipulation)
       ▼
@@ -161,11 +166,31 @@ Message acheteur
       │     • une seule salutation par conversation
       │     • typographie française
       ▼
+ Correction d'offre (rules.py::corrige_offre)
+      │     le bon montant est-il annoncé ? sinon réponse déterministe
+      ▼
  Vérification : nouvelle bulle SORTANTE contenant notre texte
       │     (sinon l'envoi est considéré comme échoué → retenté au scan suivant)
       ▼
  Historique enregistré en base (uniquement après un envoi confirmé)
 ```
+
+### Politique de prix (offres chiffrées)
+
+Comparer deux nombres et ne pas se tromper de référence est ce qu'un modèle 4B
+rate (il a répondu « à 400 € ça me va » à une offre de 370 €, soit le prix
+plancher au lieu de la contre-offre). La décision est donc prise **en dur**
+dans `rules.py`, le modèle ne fait que la formuler, et `corrige_offre()`
+vérifie derrière que le bon montant a bien été écrit.
+
+| Offre de l'acheteur | Réponse |
+|---------------------|---------|
+| ≥ `prix_plancher_eur` | acceptation : « Merci, à 400 € ça me va. » (prix seulement : ni réservation, ni paiement, ni rendez-vous) |
+| < `prix_plancher_eur`, `prix_contre_offre_eur` renseigné | contre-offre : « Merci pour votre offre. À 430 € je vous la laisse. » |
+| < `prix_plancher_eur`, aucune contre-offre | refus poli, sans aucun chiffre de ton côté |
+| Aucun montant identifiable | le modèle décide ; `accepte_sous_le_plancher()` bloque toute acceptation sous le plancher |
+
+`prix_plancher_eur` n'est **jamais** annoncé comme tel.
 
 ### Quelle conversation le bot ouvre-t-il ?
 
@@ -193,7 +218,7 @@ conversations.
 |---------|------|
 | `config.py` | Constantes techniques (délais, modèle, chemins) + `BASE_DIR` |
 | `prompts.py` | `PROMPT_ROUTER`, `BASE_PERSONA`, `PROMPTS`, `REPONSES_STATIQUES` (git‑ignored) |
-| `rules.py` | Règles déterministes : conclusion, injection de prompt, disponibilité + `sanitize_reply()` |
+| `rules.py` | Règles déterministes : conclusion, injection, disponibilité, décision de prix (`corrige_offre`) + `sanitize_reply()` |
 | `llm.py` | `classify_message()` (appel 1) + `generate_reply()` (appel 2) |
 | `main.py` | Orchestration : règles → classification → génération → envoi |
 | `leboncoin.py` | Lecture des conversations, détection du rôle, envoi vérifié |
@@ -267,17 +292,20 @@ Dans `main.py` :
 - `PROMPTS["general"]` — salutations, disponibilité, messages vagues
 - `REPONSES_STATIQUES` — réponses figées (hors_sujet, manipulation)
 
-**Prix.** Le bot ne révèle jamais `prix_plancher_eur` (confidentiel). Comportement
-par défaut face à une offre chiffrée :
+**Prix.** Le bot ne révèle jamais `prix_plancher_eur` (confidentiel). La décision
+est prise en dur dans `rules.py` (cf. « Politique de prix » plus haut) :
 
 | Offre reçue | Réponse |
 |-------------|---------|
-| `>= prix_plancher_eur` | acceptation annoncée |
-| `< prix_plancher_eur` | refus poli, **sans** révéler le plancher |
+| `>= prix_plancher_eur` | acceptation : « Merci, à 400 € ça me va. » |
+| `< prix_plancher_eur` + `prix_contre_offre_eur` | contre-offre : « À 430 € je vous la laisse. » |
+| `< prix_plancher_eur`, sans contre-offre | refus poli, **sans** révéler le plancher |
 
-Pour qu'il **contre-propose** automatiquement, renseigne
-`prix_contre_offre_eur` (valeur entre `prix_plancher_eur` et `prix_affiche_eur`).
-Laisse `None` si tu veux garder la main sur les contre-offres.
+Renseigne `prix_contre_offre_eur` (valeur entre `prix_plancher_eur` et
+`prix_affiche_eur`, ici `430`) pour qu'il contre-propose ; laisse `None` pour
+qu'il refuse sans avancer de chiffre. Pour interdire toute acceptation
+automatique, il suffit de retirer `prix_plancher_eur` : le bot refuse alors
+toujours et te laisse trancher.
 
 Après chaque modification, valide avec `python -u tools/selftest_llm.py`.
 
