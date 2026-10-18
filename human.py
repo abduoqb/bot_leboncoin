@@ -17,7 +17,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ── Position souris (Bug 6) ───────────────────────────────────────────────────
-_last_mouse_pos: dict = {"x": 960, "y": 540}  # position initiale par défaut
+_last_mouse_pos = None  # initialisée au 1er mouvement sur le centre réel de la fenêtre
 
 
 # ── Délais ────────────────────────────────────────────────────────────────────
@@ -82,9 +82,16 @@ async def human_move(page, x: float, y: float):
     """
     global _last_mouse_pos
     try:
-        # Position actuelle : la dernière connue (Bug 6)
-        curr_x = _last_mouse_pos["x"]
-        curr_y = _last_mouse_pos["y"]
+        # Position actuelle : la dernière connue, sinon le centre réel de la fenêtre
+        if _last_mouse_pos is None:
+            try:
+                vp = await page.evaluate("() => ({ w: innerWidth, h: innerHeight })")
+                curr_x, curr_y = vp["w"] / 2, vp["h"] / 2
+            except Exception:
+                curr_x, curr_y = 800, 450
+        else:
+            curr_x = _last_mouse_pos["x"]
+            curr_y = _last_mouse_pos["y"]
 
         # Petite variation sur la destination (on ne clique jamais exactement au pixel)
         dest_x = x + random.uniform(-3, 3)
@@ -109,24 +116,32 @@ async def human_move(page, x: float, y: float):
         logger.debug(f"human_move erreur (non bloquant): {e}")
 
 
-async def human_click(page, element):
+async def human_click(page, element) -> bool:
     """
     Déplace la souris vers l'élément, hésite légèrement, puis clique.
+    Retourne True si le clic a bien été effectué.
     """
     try:
         box = await element.bounding_box()
-        if box:
+    except Exception:
+        box = None
+
+    if box:
+        try:
             cx = box["x"] + box["width"] / 2 + random.uniform(-5, 5)
             cy = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
             await human_move(page, cx, cy)
             # Micro-hésitation avant le clic (réflexe humain)
             await asyncio.sleep(random.uniform(0.08, 0.25))
-            await element.click()
-        else:
-            await element.click()
+        except Exception as e:
+            logger.debug(f"human_click (mouvement) : {e}")
+
+    try:
+        await element.click(timeout=10000)
+        return True
     except Exception as e:
-        logger.debug(f"human_click fallback: {e}")
-        await element.click()
+        logger.warning(f"human_click : clic impossible ({e})")
+        return False
 
 
 # ── Clavier ───────────────────────────────────────────────────────────────────
@@ -139,7 +154,10 @@ async def human_type(page, element, text: str):
     from config import TYPING_SPEED_MIN, TYPING_SPEED_MAX
 
     # Cliquer sur l'élément pour le focus
-    await element.click()
+    try:
+        await element.click(timeout=10000)
+    except Exception as e:
+        logger.debug(f"human_type : focus impossible ({e})")
 
     for i, char in enumerate(text):
         await page.keyboard.type(char, delay=0)  # on gère le délai manuellement
@@ -204,8 +222,11 @@ async def arrive_on_page(page):
             await human_scroll(page, "up", random.randint(50, 150))
 
     # Mouvement de souris aléatoire ("on cherche quelque chose")
-    vp = page.viewport_size or {"width": 1920, "height": 1080}
-    rx = random.uniform(200, vp["width"] - 200)
-    ry = random.uniform(150, vp["height"] - 400)
+    try:
+        vp = await page.evaluate("() => ({ w: innerWidth, h: innerHeight })")
+    except Exception:
+        vp = {"w": 1640, "h": 900}
+    rx = random.uniform(200, max(300, vp["w"] - 200))
+    ry = random.uniform(150, max(250, vp["h"] - 400))
     await human_move(page, rx, ry)
     await asyncio.sleep(random.uniform(0.3, 0.8))

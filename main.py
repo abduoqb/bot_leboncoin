@@ -5,9 +5,11 @@ import logging.handlers
 import sys
 import random
 from datetime import datetime, timedelta
-from config import SCAN_MIN, SCAN_MAX, NIGHT_START_HOUR, NIGHT_END_HOUR, MAX_HISTORY, PROMPTS, REPONSES_STATIQUES, BASE_PERSONA
+from config import (
+    SCAN_MIN, SCAN_MAX, NIGHT_START_HOUR, NIGHT_END_HOUR, MAX_HISTORY,
+    PROMPTS, REPONSES_STATIQUES, BASE_PERSONA, MAX_CONVS_PER_SCAN,
+)
 
-MAX_CONVS_PER_SCAN = 3  # Limite de conversations traitées par scan (anti-bot)
 from conversation import ConversationManager
 from llm import generate_reply, classify_message, init_session, close_session
 from leboncoin import LeboncoinClient
@@ -136,10 +138,14 @@ async def main():
     await init_session()  # Session HTTP partagée (Bug 4)
     await lbc.start()
 
-    # En mode CDP, le Chrome réel gère l'auth.
-    # En mode Chromium, login manuel seulement si aucune session sauvegardée.
-    if not lbc._is_cdp and not lbc.session_exists():
-        await lbc.login()
+    # Vérifie la connexion. Si un login ou un captcha est requis, on met le bot
+    # en pause en attendant l'intervention humaine (jamais de résolution auto).
+    if not await lbc.ensure_ready():
+        logger.error("❌ Session non connectée après attente. Arrêt du bot.")
+        await lbc.close()
+        await close_session()
+        await db.close()
+        return
 
     logger.info(f"🚀 Bot démarré — comportement humain activé (attente aléatoire + pause nocturne {NIGHT_START_HOUR}h-{NIGHT_END_HOUR}h)")
 

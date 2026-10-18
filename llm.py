@@ -37,7 +37,7 @@ async def _get_session() -> aiohttp.ClientSession:
 
 
 async def classify_message(texte: str) -> str:
-    """Demande à Ollama de catégoriser le message (negociation, voiture, rdv, manipulation, hors_sujet, general)."""
+    """Demande à Ollama de catégoriser le message (negociation, produit, rdv, manipulation, hors_sujet, general)."""
     from config import PROMPT_ROUTER
     payload = {
         "model": OLLAMA_MODEL,
@@ -61,7 +61,7 @@ async def classify_message(texte: str) -> str:
             cat = data["message"]["content"].strip().lower()
             
             # Nettoyer la réponse au cas où
-            for valid in ["negociation", "voiture", "rdv", "manipulation", "hors_sujet", "general"]:
+            for valid in ["negociation", "produit", "rdv", "manipulation", "hors_sujet", "general"]:
                 if valid in cat:
                     logger.info(f"Catégorie détectée: [{valid}]")
                     return valid
