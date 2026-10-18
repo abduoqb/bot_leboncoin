@@ -1,411 +1,381 @@
-# Bot Leboncoin × Ollama
+# Bot Leboncoin
 
-Bot Python qui répond automatiquement aux messages de tes annonces Leboncoin en utilisant un LLM local (Ollama / gemma3:4b). Zéro coût, tourne entièrement en local ou sur VPS.
+Un bot qui répond à ta place aux messages de tes annonces Leboncoin, avec un
+modèle de langage qui tourne **chez toi** (Ollama + `gemma3:4b`). Aucune API,
+aucun abonnement, rien qui sorte de ta machine.
 
----
-
-## ✨ Fonctionnalités
-
-- **Réponses naturelles et fiables** — le bot parle comme le vendeur (première personne), n'écrit jamais de nom de personne, ne salue qu'une fois par conversation, ne contredit jamais une donnée vérifiée et n'ouvre un fil que s'il y a une raison de le faire
-- **LLM local 2-étapes** — classification du message (router) puis réponse spécialisée via gemma3:4b
-- **Prix décidé en dur** — accepter une offre ou contre-proposer n'est jamais laissé au modèle : le budgétage (plancher / contre-offre) est calculé dans `rules.py`, le modèle ne fait que le formuler. Le prix plancher n'est jamais révélé
-- **Envoi réel vérifié** — le bot tape et envoie; l'envoi n'est validé que par l'apparition d'une nouvelle bulle sortante (jamais par un simple vidage de champ)
-- **Anti-détection avancée** — frappe humaine au clavier (avec fautes de frappe corrigées), mouvements de souris Bézier, scrolls naturels, navigation dispersée, pause nocturne, **aucune relecture inutile des conversations**
-- **Captcha DataDome** — tentative de glissement automatique « humain » du slider, avec repli sur intervention humaine
-- **Pré-réponses Leboncoin** — détectées, tracées, et utilisées en repli si le LLM ne produit rien
-- **Ne répond jamais à la place d'un vendeur** — les conversations où TU es l'acheteur (« À propos de ce vendeur ») sont ignorées
-- **Offres officielles Leboncoin** — le bot ne répond jamais à ce message automatique : c'est à toi de trancher (il te le signale dans les logs)
-- **Auto-relance du navigateur** — si Chrome crashe ou est fermé, le bot redémarre le profil et reprend
-- **Indépendant du répertoire courant** — profil, base et dumps sont toujours résolus depuis la racine du projet
-- **Aucun message perdu** — un envoi non confirmé est retenté au scan suivant
-- **Pause nocturne** — inactif entre 1h et 6h du matin (configurable)
-- **Repos intelligent** — après 10 scans vides consécutifs, pause de 1h
-- **Contexte fidèle** — l'historique envoyé au modèle vient du **fil réellement lu dans la page**, pas de la base : les messages que tu as écrits à la main sont pris en compte, et aucune ancienne réponse fautive ne peut être réinjectée
-- **Contexte conversationnel** — SQLite async garde la trace et l'anti-doublon de chaque conversation
-- **Retry automatique** — 3 tentatives sur erreur réseau Ollama
-- **Logging complet** — console (UTF-8 forcé, sinon les emojis font planter les logs Windows) + fichier `bot.log` rotatif (5 Mo × 3 fichiers)
-- **Graceful shutdown** — Ctrl+C ferme proprement navigateur, session HTTP et base SQLite
+Concrètement : tu vends une PS5, tu vas dormir, et le lendemain les acheteurs ont
+eu une réponse. Le bot lit tes conversations, écrit dans ton style, envoie, puis
+recommence quelques minutes plus tard.
 
 ---
 
-## 📁 Structure
+## Le problème qu'il résout
+
+Les messages arrivent n'importe quand : à 23h, pendant une réunion, le dimanche.
+Un acheteur qui n'a pas de réponse dans l'heure va voir ailleurs. Et dans la
+plupart des cas, les questions sont toujours les mêmes : *toujours dispo ?*,
+*vous feriez un prix ?*, *possible samedi ?*.
+
+Le bot s'occupe de ces questions-là. Ce qui engage vraiment de l'argent reste de
+ton côté.
+
+---
+
+## Ce qu'il fait
+
+### Il répond à toutes les conversations
+
+Toutes les 1 à 3 minutes, il ouvre la liste de tes messages. Pour chaque
+conversation **où tu es le vendeur** et où un acheteur attend une réponse, il
+rédige et il envoie. Les conversations où c'est toi qui achètes sont ignorées :
+il ne répond pas à la place d'un vendeur.
+
+### Il écrit comme toi
+
+Le modèle parle à la première personne, en français naturel, en une à trois
+phrases. Il n'écrit **jamais** de nom de personne, ne salue qu'une fois par
+conversation, et ne contredit pas ce que dit ton annonce.
+
+### L'argent ne passe jamais par le modèle
+
+C'est le point le plus important, et la raison d'être de `rules.py`.
+
+Un modèle 4B compare mal deux nombres et se trompe de référence : il a réellement
+répondu « à 400 € ça me va » à une offre de 370 €, c'est-à-dire qu'il a annoncé
+le prix plancher au lieu de la contre-offre. Accepter ou contre-proposer est donc
+décidé **par du code**. Le modèle ne fait que mettre la décision en mots, et une
+vérification repasse derrière pour confirmer que le bon montant a été écrit.
 
 ```
-bot_lbc/
-├── main.py            # Boucle principale, orchestration, pause nocturne, idle rest
-├── config.py          # Constantes (LLM, anti-bot, navigateur) + BASE_DIR
-├── prompts.py         # Prompts (git-ignored) : routeur, persona, réponses statiques
-├── conversation.py    # ConversationManager async (SQLite via asyncio.to_thread)
-├── llm.py             # Client Ollama async (classify + generate, session partagée)
-├── leboncoin.py       # LeboncoinClient (Playwright, profil Chrome persistant)
-├── instance.py        # Verrou système : un seul programme par profil Chrome
-├── captcha.py         # Glissement « humain » du slider DataDome
-├── rules.py           # Règles déterministes AVANT le LLM (conclusion, injection,
-│                      #   disponibilité) + nettoyage des réponses générées
-├── human.py           # Simulation humaine (Bézier, frappe clavier, scroll, pauses)
-├── tools/             # Outils de diagnostic et de test (non utilisés en production)
-│   ├── dry_run.py         # Test À BLANC : lit + génère, sans rien envoyer
-│   ├── selftest_llm.py    # Boucle qualité : batterie de messages → catégorie + réponse
-│   ├── selftest_scan.py   # Vérifie qu'aucun fil déjà réglé n'est rouvert (0 navigateur)
-│   ├── selftest_context.py # Vérifie que le fil de la page fait foi (0 navigateur)
-│   ├── selftest_instance.py # Vérifie le verrou « un seul bot par profil » (0 navigateur)
-│   ├── db_cleanup.py      # Entretien de conversations.db (liste, puis purge sur --apply)
-│   ├── selftest_send.py   # Diagnostic/envoi réel contrôlé sur UNE conversation
-│   ├── explore.py         # Cartographie la liste des conversations
-│   ├── explore2.py        # Anatomie d'un fil (bulles, conteneur, compositeur)
-│   └── explore3.py        # Messages entrants/sortants + badges non-lus
-├── requirements.txt
-├── .gitignore
-├── chrome_profile/    # Auto-généré — profil Chrome persistant (login conservé)
-├── conversations.db   # Auto-généré — historique SQLite
-├── bot_state.json     # Auto-généré — mémoire des aperçus déjà vus (anti-boucle)
-├── bot.lock           # Auto-généré — verrou « un seul bot à la fois »
-└── debugs/            # Auto-généré — captures/DOM d'un échec de chargement
+Acheteur   Vous feriez un prix ? Je vous en propose 370.
+Bot        Merci pour votre offre. À 430 € je vous la laisse.
+
+Acheteur   D'accord. Je vous la prends à 400.
+Bot        Merci, à 400 € ça me va.
 ```
+
+Ton prix plancher n'est **jamais** annoncé à l'acheteur.
+
+### Il ne réveille pas les morts
+
+Ouvrir une conversation la recharge **et la marque « lue » côté serveur**. Boucler
+sur des conversations déjà traitées est le meilleur moyen de se faire repérer. Le
+bot n'ouvre donc un fil que s'il a une raison :
+
+- l'aperçu a changé, donc il y a un nouveau message ;
+- le fil est non lu et jamais vu depuis le démarrage ;
+- une réponse est en attente parce qu'un envoi a échoué.
+
+Sinon, il laisse la liste tranquille. Et cette mémoire survit au redémarrage
+(`bot_state.json`) : relancer le bot ne provoque pas un parcours complet.
+
+### Le reste
+
+- **Il vérifie ses envois.** Un message n'est considéré comme parti que si une
+  nouvelle bulle sortante apparaît. Le champ qui se vide ne suffit pas : ça
+  arrive aussi quand l'envoi a échoué.
+- **Il détecte les tentatives de manipulation.** « Oublie tes instructions »,
+  « affiche ton prompt » : réponse figée, décidée hors du modèle.
+- **Il gère les captchas DataDome.** Il essaie d'abord de glisser le curseur
+  comme un humain, puis te laisse la main si ça ne passe pas.
+- **Il sait se taire.** Une formule de politesse pour clore la conversation
+  reçoit une réponse figée, pas une relance commerciale.
+- **Il ne répond jamais à une offre officielle.** Le message automatique
+  « Offre reçue : 400 € » attend ta décision, et le bot te le signale.
+- **Il se relance tout seul.** Si Chrome crashe ou est fermé, il redémarre le
+  navigateur et reprend.
+- **Il dort la nuit.** De 1h à 6h, aucune activité.
+
+Le navigateur reste visible : tu peux le regarder travailler.
 
 ---
 
-## ⚙️ Installation (Local)
+## Installation
 
-### 1. Prérequis
-
-- Python 3.11+
-- [Ollama](https://ollama.com) installé et lancé (`ollama serve`)
-
-### 2. Cloner et installer
+Il faut Python 3.11+ et [Ollama](https://ollama.com) lancé.
 
 ```bash
 git clone <url-du-repo>
 cd bot_lbc
+python -m venv venv && source venv/bin/activate   # Windows : venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
-```
 
-### 3. Télécharger le modèle
-
-```bash
 ollama pull gemma3:4b
 ```
 
-### 4. Se connecter une seule fois (profil persistant)
+### 1. Renseigner tes données de vente
 
-Le bot utilise un **vrai Chrome avec un profil persistant** (`chrome_profile/`).
-C'est ce qui rend l'empreinte navigateur authentique (et évite DataDome), et ça
-conserve ta connexion entre les redémarrages.
+`prompts.py` contient tes informations personnelles, il n'est donc pas dans le
+dépôt. Copie le modèle et remplis-le :
+
+```bash
+cp prompts.example.py prompts.py
+```
+
+Le minimum à renseigner est le bloc `VENTE` : ville, prix affiché, prix plancher,
+contre-offre. Tout est détaillé dans **Configuration**.
+
+### 2. Se connecter une seule fois
 
 ```bash
 python main.py
 ```
 
-Au premier lancement, une fenêtre Chrome s'ouvre :
-1. **Connecte-toi** à ton compte Leboncoin (email + mot de passe).
-2. Si un **captcha DataDome** apparaît, le bot **tente d'abord de le glisser
-   seul** (trajectoire humaine). S'il échoue, il te laisse 5 minutes pour le faire.
-3. C'est tout : la session est conservée dans `chrome_profile/`, tu n'auras plus
-   à te reconnecter (sauf expiration au bout de plusieurs semaines).
+Une fenêtre Chrome s'ouvre. Connecte-toi à ton compte Leboncoin et glisse le
+captcha s'il y en a un. C'est tout : la session est conservée dans
+`chrome_profile/`, tu n'auras plus à te reconnecter, sauf expiration au bout de
+plusieurs semaines.
 
-> Le glissement automatique du captcha ne fonctionne pas toujours : DataDome
-> note aussi la dynamique de la souris et l'empreinte de l'appareil. En cas
-> d'échec, tu es prévenu et le bot attend ton intervention (`CAPTCHA_WAIT_SECONDS`).
->
-> La connexion automatique par identifiants n'est pas implémentée : si tu veux
+> La connexion par identifiants n'est pas automatisée, volontairement. Pour
 > changer de compte, supprime le dossier `chrome_profile/` et relance.
 
-#### Alternative : Chrome piloté en CDP
+---
 
-Si tu préfères contrôler ton propre Chrome, mets `BROWSER_MODE = "cdp"` dans
-`config.py` puis lance :
-
-```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\tmp\chrome_bot"
-```
-
-Lance ensuite `python main.py`.
-
-### 5. Lancer le bot
+## Le lancer
 
 ```bash
-python main.py
+python main.py            # la boucle normale
+python main.py --once     # un seul cycle complet, puis arrêt
 ```
 
-### 6. Vérifier sans rien envoyer
+Et pour voir ce qu'il ferait **sans rien envoyer** :
 
 ```bash
-python tools/dry_run.py
+python tools/dry_run.py           # résumé
+python tools/dry_run.py --debug   # avec les logs détaillés
 ```
 
-Lit les conversations, classifie et génère les réponses **sans rien poster**.
-
-### 7. Lancer un seul scan (test réel contrôlé)
-
-```bash
-python main.py --once
-```
-
-Un seul cycle lecture → génération → **envoi**, puis arrêt.
+C'est le premier réflexe quand une réponse te semble bizarre : `dry_run` montre
+le message reçu, la catégorie choisie et la réponse générée, sans rien poster.
 
 ---
 
-## 🏗️ Architecture (règles → routeur → génération)
+## Configuration
 
-```
-Message acheteur
-      │
-      ▼
- Règles déterministes (rules.py)   ← avant tout appel LLM
-      │   • injection de prompt  → réponse figée (sécurité)
-      │   • formule de conclusion → réponse figée
-      │   • question de disponibilité → réponse figée (donnée vérifiée)
-      ▼
- Appel 1 — Classifier LLM (gemma3, temp=0, max 5 tokens)
-      │     → renvoie UN mot : negociation / produit / rdv /
-      │       hors_sujet / manipulation / general
-      ▼
- Si négociation avec un montant clair : décision chiffrée (rules.py)
-      │     accepter / contre-offrir, transmise au modèle déjà tranchée
-      ▼
- Appel 2 — Réponse LLM avec le mini-prompt spécialisé
-      │     (ou réponse statique si hors_sujet / manipulation)
-      ▼
- Nettoyage déterministe (rules.py::sanitize_reply)
-      │     • aucun nom de personne, « Monsieur Co » → « Monsieur »
-      │     • une seule salutation par conversation
-      │     • typographie française
-      ▼
- Correction d'offre (rules.py::corrige_offre)
-      │     le bon montant est-il annoncé ? sinon réponse déterministe
-      ▼
- Vérification : nouvelle bulle SORTANTE contenant notre texte
-      │     (sinon l'envoi est considéré comme échoué → retenté au scan suivant)
-      ▼
- Historique enregistré en base (uniquement après un envoi confirmé)
-```
+### `prompts.py` : tes données et ton style
 
-### Politique de prix (offres chiffrées)
-
-Comparer deux nombres et ne pas se tromper de référence est ce qu'un modèle 4B
-rate (il a répondu « à 400 € ça me va » à une offre de 370 €, soit le prix
-plancher au lieu de la contre-offre). La décision est donc prise **en dur**
-dans `rules.py`, le modèle ne fait que la formuler, et `corrige_offre()`
-vérifie derrière que le bon montant a bien été écrit.
-
-| Offre de l'acheteur | Réponse |
-|---------------------|---------|
-| ≥ `prix_plancher_eur` | acceptation : « Merci, à 400 € ça me va. » (prix seulement : ni réservation, ni paiement, ni rendez-vous) |
-| < `prix_plancher_eur`, `prix_contre_offre_eur` renseigné | contre-offre : « Merci pour votre offre. À 430 € je vous la laisse. » |
-| < `prix_plancher_eur`, aucune contre-offre | refus poli, sans aucun chiffre de ton côté |
-| Aucun montant identifiable | le modèle décide ; `accepte_sous_le_plancher()` bloque toute acceptation sous le plancher |
-
-`prix_plancher_eur` n'est **jamais** annoncé comme tel.
-
-### Quelle conversation le bot ouvre-t-il ?
-
-Ouvrir un fil recharge une page **et le marque « lu » côté serveur**. Le bot
-n'ouvre donc un fil que s'il a une raison de le faire (`leboncoin.py` →
-`_candidats`), sinon il laisse la liste tranquille :
-
-| Situation | Le fil est-il ouvert ? |
-|-----------|------------------------|
-| L'aperçu a changé (nouveau message) | ✅ oui |
-| L'aperçu n'a jamais été vu (démarrage, nouvelle annonce) | ✅ oui, une fois |
-| Non lu et jamais inspecté depuis le démarrage | ✅ oui, une fois |
-| Réponse en attente (envoi raté) | ✅ oui, **max 3 tentatives** puis abandon |
-| Fil coupé par la limite de scan (6 fils/scan) | ✅ oui, **au scan suivant** |
-| Déjà inspecté, rien à répondre | ❌ non |
-| Nous sommes l'acheteur (« À propos de ce vendeur ») | ❌ jamais |
-| Fil illisible (captcha, lien absent) | ⚠️ 3 tentatives puis ignoré |
-
-Un point important : l'aperçu d'un fil n'est mémorisé **qu'après avoir été
-ouvert**. Un fil coupé par la limite de scan reste donc candidat au scan
-suivant — sinon son message serait marqué « vu » sans avoir été lu et il ne
-serait plus jamais inspecté (un message d'acheteur perdu).
-
-La mémoire des aperçus déjà vus est persistée dans `bot_state.json` : un
-redémarrage ne provoque donc **pas** un nouveau parcours complet de toutes les
-conversations.
-
-### D'où vient le contexte envoyé au LLM ?
-
-**Le fil lu dans la page fait foi** (`JS_THREAD` → `messages`). C'est lui qui
-contient la réalité : les messages que *tu* as écrits à la main, ceux des
-conversations qui existaient avant l'installation du bot, tout ce que la base
-n'a jamais vu. La base ne sert plus qu'à deux choses :
-
-| Rôle de la base | Détail |
-|-----------------|--------|
-| **Compléter** | La page ne rend que les derniers messages : `build_context()` aligne la base sur le premier message du fil et ne reprend que ceux qui précèdent. Rien n'est compté deux fois. |
-| **Anti-doublon & trace** | Après un envoi confirmé, `user` + `assistant` sont enregistrés. Si un envoi échoue, rien n'est enregistré et le scan suivant retente. |
-
-Conséquence : une base incomplète, ou qui contient d'anciennes réponses fautives
-(« Bonjour Monsieur Co… »), ne peut plus polluer la réponse. Le nombre de
-messages déjà envoyés est lui aussi déduit du fil, donc plus de « Bonjour »
-répété au démarrage parce que la base est vide.
-
-L'outil d'entretien liste et purge les lignes inutiles (simulation par défaut,
-sauvegarde horodatée avec `--apply`) :
-
-```bash
-python -u tools/db_cleanup.py                        # liste tout
-python -u tools/db_cleanup.py --vides --tests        # ce qui serait supprimé
-python -u tools/db_cleanup.py --vides --tests --apply
-python -u tools/db_cleanup.py --avant 2026-06-01     # vieux fils
-python -u tools/db_cleanup.py --ids a1b2,c3d4
-```
-
-**Fichiers impliqués :**
-
-| Fichier | Rôle |
-|---------|------|
-| `config.py` | Constantes techniques (délais, modèle, chemins) + `BASE_DIR` |
-| `prompts.py` | `PROMPT_ROUTER`, `BASE_PERSONA`, `PROMPTS`, `REPONSES_STATIQUES` (git‑ignored) |
-| `rules.py` | Règles déterministes : conclusion, injection, disponibilité, décision de prix (`corrige_offre`) + `sanitize_reply()` |
-| `llm.py` | `classify_message()` (appel 1) + `generate_reply()` (appel 2) |
-| `main.py` | Orchestration : règles → classification → génération → envoi |
-| `leboncoin.py` | Lecture des conversations et du fil (`JS_THREAD`), détection du rôle, envoi vérifié |
-| `human.py` | Mouvement souris Bézier, frappe clavier réaliste, scroll naturel |
-| `captcha.py` | Glissement « humain » du slider DataDome |
-| `conversation.py` | Historique SQLite async ; `fil_vers_historique()` + `build_context()` (fil prioritaire) |
-| `instance.py` | Verrou système « un seul programme par profil Chrome » (`bot.lock`) |
-
----
-
-## 🛡️ Anti-Détection
-
-| Protection | Détail |
-|-----------|--------|
-| **Profil Chrome persistant** | Vrai Chrome + `chrome_profile/` → empreinte authentique et session conservée |
-| **Un seul Chrome par profil** | Un profil Chrome ne s'ouvre qu'une fois : un verrou système (`bot.lock`) empêche un second programme de le lancer, et le bot détecte le cas au lieu de relancer en boucle |
-| **Navigation par clics** | Jamais de deep-link vers `/messages/id/...` (cible n°1 de DataDome) : on clique comme un humain |
-| **Captcha DataDome** | Glissement automatique « humain » (easing, jitter, dépassement/correction, 0,75-1,4 s) puis repli sur intervention humaine |
-| **Intervalles aléatoires** | 75-180 s entre chaque scan (configurable) |
-| **Aucune relecture inutile** | Un fil n'est ouvert que si son aperçu change, s'il est non lu et jamais vu, ou si une réponse est en attente. Ouvrir un fil le marque « lu » : boucler dessus était le principal signal |
-| **Mémoire persistante** | `bot_state.json` : un redémarrage ne relit pas toutes les conversations |
-| **Pause nocturne** | Inactif entre 1h et 6h, aucune requête |
-| **Repos intelligent** | Après 10 scans vides → pause 1h |
-| **Navigation dispersée** | Le bot passe par l'accueil avant chaque consultation de messages |
-| **Frappe clavier réaliste** | `page.keyboard.type()` caractère par caractère (40-120ms/touche), avec fautes de frappe corrigées (~4 %) |
-| **Mouvements souris** | Trajectoires courbe de Bézier avec position trackée + mouvements parasites |
-| **Scrolls naturels** | Petits coups progressifs avec pauses "lecture" (y compris dans le fil avant de répondre) |
-| **Pause de réflexion** | Délai proportionnel au message de l'acheteur avant de répondre |
-| **Champ nettoyé avant écriture** | Une pré-réponse Leboncoin pré-remplie ne peut pas se mélanger à notre message |
-| **Limite par scan** | Maximum 3 conversations traitées par scan |
-| **Auto-relance navigateur** | Page/Chrome mort → redémarrage automatique du profil persistant |
-
----
-
-## 🔧 Configuration
-
-Toutes les constantes sont dans `config.py` :
-
-| Variable | Défaut | Description |
-|----------|--------|-------------|
-| `OLLAMA_MODEL` | `gemma3:4b` | Modèle Ollama (local, gratuit) |
-| `OLLAMA_URL` | `http://localhost:11434/api/chat` | Endpoint Ollama |
-| `SCAN_MIN` | `75` | Secondes minimum entre scans |
-| `SCAN_MAX` | `180` | Secondes maximum entre scans |
-| `NIGHT_START_HOUR` | `1` | Début pause nocturne (1h) |
-| `NIGHT_END_HOUR` | `6` | Fin pause nocturne |
-| `TYPING_SPEED_MIN` | `40` | Ms minimum entre frappes |
-| `TYPING_SPEED_MAX` | `120` | Ms maximum entre frappes |
-| `MAX_HISTORY` | `8` | Messages max dans le contexte LLM |
-| `MAX_CONVS_PER_SCAN` | `3` | Conversations inspectées/traitées max par scan |
-| `BROWSER_MODE` | `profile` | `profile` (recommandé) ou `cdp` |
-| `PROFILE_DIR` | `<racine>/chrome_profile` | Dossier du profil Chrome persistant (absolu) |
-| `CHROME_CHANNEL` | `chrome` | `chrome` = vrai Google Chrome ; `None` = Chromium |
-| `CDP_URL` | `http://localhost:9222` | URL CDP si `BROWSER_MODE = "cdp"` |
-| `CAPTCHA_WAIT_SECONDS` | `300` | Temps laissé à l'humain après échec du glissement auto |
-| `DEBUG_SCREENSHOTS` | `True` | Dump PNG+HTML dans `debugs/` quand un fil ne charge pas |
-
-Dans `main.py` :
-
-| Variable | Défaut | Description |
-|----------|--------|-------------|
-| `IDLE_SCAN_LIMIT` | `10` | Scans vides avant pause repos |
-| `IDLE_REST_SECONDS` | `3600` | Durée du repos (1h) |
-
-### Modifier les prompts vendeur
-
-Éditez `prompts.py` :
-- `VENTE` / `PRODUIT` — les données factuelles de ta vente
-- `BASE_PERSONA` — style, fiabilité, confidentialité
-- `PROMPTS["negociation"]` — stratégie de prix
-- `PROMPTS["produit"]` — infos techniques
-- `PROMPTS["rdv"]` — dispo et localisation
-- `PROMPTS["general"]` — salutations, disponibilité, messages vagues
-- `REPONSES_STATIQUES` — réponses figées (hors_sujet, manipulation)
-
-**Prix.** Le bot ne révèle jamais `prix_plancher_eur` (confidentiel). La décision
-est prise en dur dans `rules.py` (cf. « Politique de prix » plus haut) :
-
-| Offre reçue | Réponse |
-|-------------|---------|
-| `>= prix_plancher_eur` | acceptation : « Merci, à 400 € ça me va. » |
-| `< prix_plancher_eur` + `prix_contre_offre_eur` | contre-offre : « À 430 € je vous la laisse. » |
-| `< prix_plancher_eur`, sans contre-offre | refus poli, **sans** révéler le plancher |
-
-Renseigne `prix_contre_offre_eur` (valeur entre `prix_plancher_eur` et
-`prix_affiche_eur`, ici `430`) pour qu'il contre-propose ; laisse `None` pour
-qu'il refuse sans avancer de chiffre. Pour interdire toute acceptation
-automatique, il suffit de retirer `prix_plancher_eur` : le bot refuse alors
-toujours et te laisse trancher.
+| Bloc | Ce que c'est |
+|------|--------------|
+| `VENTE` | Ville, prix affiché, prix plancher, contre-offre, disponibilité |
+| `BASE_PERSONA` | Le ton général et les interdits (pas d'emoji, pas de nom, ne jamais dire qu'il est un bot) |
+| `PROMPTS["negociation"]` | La stratégie de prix |
+| `PROMPTS["produit"]` | Les caractéristiques à connaître |
+| `PROMPTS["rdv"]` | Disponibilités et lieu de rendez-vous |
+| `PROMPTS["general"]` | Salutations et messages vagues |
+| `REPONSES_STATIQUES` | Réponses figées (hors sujet, manipulation) |
+| `NOMS_A_NEUTRALISER` | Noms qui ne doivent jamais apparaître dans une réponse |
 
 Après chaque modification, valide avec `python -u tools/selftest_llm.py`.
 
+**La politique de prix** est appliquée par `rules.py`, pas par le modèle :
+
+- offre **≥** `prix_plancher_eur` → il accepte (« Merci, à 400 € ça me va. ») ;
+- offre **<** `prix_plancher_eur`, avec `prix_contre_offre_eur` renseigné → il
+  contre-propose (« À 430 € je vous la laisse. ») ;
+- offre **<** `prix_plancher_eur`, sans contre-offre → refus poli, sans chiffre.
+
+Deux façons de rester maître du jeu :
+
+- `prix_plancher_eur: None` → il **refuse toujours** et te laisse trancher ;
+- `prix_contre_offre_eur: None` → il refuse sans avancer de chiffre.
+
+### `config.py` : les réglages techniques
+
+| Variable | Défaut | Description |
+|----------|--------|-------------|
+| `OLLAMA_MODEL` | `gemma3:4b` | Le modèle local |
+| `OLLAMA_URL` | `http://localhost:11434/api/chat` | L'endpoint Ollama |
+| `SCAN_MIN` / `SCAN_MAX` | `75` / `180` | Secondes entre deux scans |
+| `NIGHT_START_HOUR` / `NIGHT_END_HOUR` | `1` / `6` | La pause nocturne |
+| `MAX_CONVS_PER_SCAN` | `3` | Conversations traitées par scan |
+| `MAX_HISTORY` | `8` | Messages d'historique donnés au modèle |
+| `TYPING_SPEED_MIN` / `MAX` | `40` / `120` | Millisecondes entre les frappes |
+| `BROWSER_MODE` | `profile` | `profile` (recommandé) ou `cdp` |
+| `PROFILE_DIR` | `<racine>/chrome_profile` | Le profil Chrome persistant |
+| `CHROME_CHANNEL` | `chrome` | `chrome` = vrai Chrome, `None` = Chromium |
+| `CAPTCHA_WAIT_SECONDS` | `300` | Temps laissé à l'humain pour un captcha |
+| `DEBUG_SCREENSHOTS` | `True` | Capture PNG + HTML quand un fil ne charge pas |
+
+Le repos intelligent se règle en haut de `main.py` : après `IDLE_SCAN_LIMIT`
+scans vides (10), le bot se met en pause pendant `IDLE_REST_SECONDS` (1h).
+
+### Deux réglages à connaître
+
+**Un seul programme à la fois sur `chrome_profile/`.** Un profil Chrome ne peut
+être ouvert que par un seul Chrome. Si un second programme tente de le lancer,
+Chrome n'échoue pas franchement : il ouvre des fenêtres `about:blank` dans la
+session existante et Playwright perd la connexion. Le bot pose donc un verrou
+(`bot.lock`) et refuse de démarrer si un autre tourne déjà ; `dry_run.py` et
+`selftest_send.py` font pareil.
+
+**Le bot s'arrête si personne ne se connecte.** Si la session expire, il ouvre
+Chrome et attend 5 minutes (`CAPTCHA_WAIT_SECONDS`) que tu te reconnectes. Passé
+ce délai, il s'arrête plutôt que de tourner à vide.
+
 ---
 
-## 🖥️ Déploiement VPS
+## Comment il décide (les détails)
 
-### Prérequis VPS
+### Le trajet d'un message
 
-- **RAM** : 4 Go minimum (8 Go recommandé pour Ollama)
-- **CPU** : 2 vCPU minimum
-- **Disque** : 20 Go
-- **OS** : Ubuntu 22.04 / 24.04
+```
+Message de l'acheteur
+   │
+   ├─ Règles déterministes (rules.py)          ← avant tout appel au modèle
+   │     manipulation ?        → réponse figée
+   │     formule de fin ?      → réponse figée
+   │     question de dispo ?   → réponse figée (c'est une donnée vérifiée)
+   │
+   ├─ Appel 1 : classification (gemma3, 5 tokens max)
+   │     → un seul mot : negociation / produit / rdv / general /
+   │       hors_sujet / manipulation
+   │
+   ├─ Négociation avec un montant clair : la décision est prise ici, dans
+   │     rules.py, et transmise au modèle déjà tranchée
+   │
+   ├─ Appel 2 : génération, avec le mini-prompt du thème
+   │
+   ├─ Nettoyage (sanitize_reply) : aucun nom de personne, une seule
+   │     salutation, typographie française
+   │
+   ├─ Correction d'offre (corrige_offre) : le bon montant est-il annoncé ?
+   │
+   └─ Envoi, puis vérification : une nouvelle bulle sortante est-elle
+         apparue ? Sinon, on retente au scan suivant.
+```
 
-### Installation
+L'historique n'est enregistré en base **qu'après** un envoi confirmé. Si l'envoi
+échoue, rien n'est écrit et le scan suivant reprend le même message.
+
+### D'où vient le contexte envoyé au modèle
+
+**Du fil réellement lu dans la page.** C'est lui qui contient la vérité : ce que
+tu as écrit à la main, les conversations qui existaient avant le bot, tout ce que
+la base n'a jamais vu. La base SQLite (`conversations.db`) ne sert plus qu'à deux
+choses :
+
+- **compléter** les messages plus anciens que la page n'affiche plus, en
+  s'alignant sur le premier message du fil pour ne rien compter deux fois ;
+- **garder la trace** et servir d'anti-doublon.
+
+Résultat : une base incomplète, ou qui contient d'anciennes réponses ratées, ne
+peut plus polluer une nouvelle réponse. Tu peux donc la purger sans risque :
 
 ```bash
-# Système
+python -u tools/db_cleanup.py                      # liste (ne supprime rien)
+python -u tools/db_cleanup.py --vides --tests       # ce qui serait supprimé
+python -u tools/db_cleanup.py --vides --tests --apply
+```
+
+### Discrétion
+
+Aucun de ces points n'est décoratif : ce sont exactement les traces qui font
+repérer un bot.
+
+- **Vrai Chrome, profil persistant** : l'empreinte du navigateur est authentique.
+- **Navigation par clics** : jamais de lien direct vers `/messages/id/...`, qui
+  est la cible n°1 de DataDome. On clique le lien comme un humain.
+- **Cadence irrégulière** : 75 à 180 secondes entre deux scans, tirées au hasard.
+- **Frappe réellement humaine** : caractère par caractère, 40 à 120 ms, avec
+  quelques fautes de frappe corrigées.
+- **Souris et scrolls** : trajectoires en courbe de Bézier, mouvements parasites,
+  et un petit scroll « de lecture » avant de répondre.
+- **Pause de réflexion** : un délai proportionnel à la longueur du message reçu.
+- **Navigation dispersée** : il passe par l'accueil avant de consulter les
+  messages.
+- **Champ nettoyé avant écriture** : une pré-réponse Leboncoin pré-remplie ne
+  peut pas se mélanger à son message.
+
+---
+
+## Les outils de test
+
+Deux familles : ceux qui ne touchent pas au site (rapides, à lancer souvent) et
+ceux qui pilotent Chrome.
+
+**Sans navigateur**, c'est là qu'on itère :
+
+```bash
+python -u tools/selftest_llm.py          # qualité des réponses (le plus utile)
+python -u tools/selftest_llm.py --case 5 # un seul cas
+python -u tools/selftest_scan.py         # règle anti-boucle de lecture
+python -u tools/selftest_context.py      # priorité au fil de la page
+python -u tools/selftest_instance.py     # verrou « un seul bot »
+```
+
+`selftest_llm.py` fait passer 24 messages d'acheteurs réalistes et 4
+conversations déjà engagées au classifieur et à la génération, puis vérifie
+39 règles déterministes (nettoyage, disponibilité, garde-fou du prix plancher,
+décision chiffrée, correction d'offre). C'est la boucle : repérer un raté,
+ajuster `prompts.py`, relancer.
+
+**Avec Chrome** (le bot doit être arrêté) :
+
+```bash
+python -u tools/dry_run.py                    # lit et génère, sans envoyer
+python -u tools/selftest_send.py              # diagnostic d'envoi, n'envoie rien
+python -u tools/selftest_send.py --confirm    # envoie réellement
+python -u tools/explore.py                    # re-cartographie le site
+```
+
+Le dernier sert si Leboncoin change son HTML. Le bot s'appuie sur des attributs
+stables (`data-qa-id="message-bubble"`, `data-spark-component="textarea"`,
+`data-qa-id="message-send"`), et quand ils cassent, `explore.py` les retrouve.
+
+---
+
+## Limites
+
+Autant le dire tout de suite :
+
+- **Le glissement du captcha n'aboutit pas toujours.** DataDome regarde aussi la
+  dynamique de la souris et l'empreinte de l'appareil. En cas d'échec, tu es
+  prévenu et le bot attend ton intervention.
+- **La session peut expirer** au bout de plusieurs semaines, et il faut alors se
+  reconnecter à la main.
+- **Un historique très long est tronqué.** La page n'affiche que les derniers
+  messages et le bot ne remonte pas indéfiniment : au-delà de `MAX_HISTORY`
+  (8 messages), le début de la conversation est ignoré. Suffisant pour répondre
+  juste au message en cours, insuffisant pour se souvenir d'un détail d'il y a
+  deux semaines.
+- **Sans GPU, chaque réponse prend 10 à 30 secondes.** Ce n'est pas gênant : le
+  bot simule de toute façon des délais humains.
+- **Leboncoin peut changer son HTML** à tout moment. C'est le principal risque de
+  casse, et `tools/explore.py` est là pour ça.
+- **Les offres chiffrées restent ta décision.** Le bot les signale, il ne clique
+  pas à ta place.
+
+---
+
+## Sur un VPS
+
+Pour tourner 24h/24, compte 4 Go de RAM (8 recommandés pour Ollama), 2 vCPU et
+20 Go de disque, sous Ubuntu 22.04 ou 24.04.
+
+```bash
+# Système et Ollama
 apt update && apt upgrade -y
 apt install -y python3 python3-pip python3-venv git wget
-
-# Ollama
 curl -fsSL https://ollama.ai/install.sh | sh
 ollama serve &
 ollama pull gemma3:4b
 
-# Chrome (pour le mode CDP)
-wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add -
-echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
-apt update && apt install -y google-chrome-stable
-
 # Projet
-git clone <url-du-repo>
-cd bot_lbc
-python3 -m venv venv
-source venv/bin/activate
+git clone <url-du-repo> && cd bot_lbc
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium
-playwright install-deps
+playwright install chromium && playwright install-deps
+cp prompts.example.py prompts.py     # puis renseigne VENTE
 ```
 
-### Login via VNC (une seule fois)
+Sur un serveur sans écran, il faut un affichage virtuel pour la connexion
+initiale, à faire une seule fois : `xvfb` + `x11vnc`, tu te connectes en VNC, tu
+logues Leboncoin, et c'est réglé, la session reste dans `chrome_profile/`.
 
-```bash
-apt install -y xvfb x11vnc
-Xvfb :99 -screen 0 1920x1080x24 &
-export DISPLAY=:99
-google-chrome --remote-debugging-port=9222 --no-first-run --disable-gpu &
-x11vnc -display :99 -forever -nopw &
-```
-
-Connectez-vous en VNC sur `VOTRE_IP:5900`, loguez-vous sur Leboncoin, puis lancez le bot.
-
-### Service systemd (tourne H24)
-
-```bash
-sudo nano /etc/systemd/system/bot-lbc.service
-```
+Pour le faire tourner en service, l'essentiel est le fichier systemd
+`/etc/systemd/system/bot-lbc.service` :
 
 ```ini
 [Unit]
@@ -414,7 +384,6 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
 WorkingDirectory=/root/bot_lbc
 ExecStart=/root/bot_lbc/venv/bin/python main.py
 Restart=on-failure
@@ -425,116 +394,12 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable bot-lbc
-sudo systemctl start bot-lbc
-
-# Logs en direct :
+sudo systemctl daemon-reload && sudo systemctl enable --now bot-lbc
 journalctl -u bot-lbc -f
 ```
 
 ---
 
-## 🧪 Vérification et boucle d'amélioration
-
-Tous les outils sont dans `tools/` et se lancent depuis la racine du projet.
-
-**1. Qualité des réponses (aucun navigateur requis — le plus rapide à itérer)**
-
-```bash
-python -u tools/selftest_llm.py          # batterie complète
-python -u tools/selftest_llm.py --case 5 # un seul cas
-```
-
-Affiche, pour 24 messages d'acheteurs réalistes (+ 4 conversations déjà
-engagées), la catégorie choisie et la réponse générée, ainsi que les contrôles
-déterministes (noms de personnes, salutations, disponibilité). Boucle : repérer
-un cas raté → ajuster `prompts.py` → relancer.
-
-**2. Boucle de scan (aucun navigateur requis)**
-
-```bash
-python -u tools/selftest_scan.py
-```
-
-Vérifie qu'un fil déjà réglé n'est **jamais** rouvert : c'est cette logique qui
-évitait au bot de relire en boucle les conversations lues.
-
-**3. Contexte (aucun navigateur requis)**
-
-```bash
-python -u tools/selftest_context.py
-```
-
-Vérifie que le contexte vient bien du fil de la page, que la base ne sert qu'à
-compléter, et qu'aucun message n'est compté deux fois au raccord.
-
-**4. Verrou d'instance (aucun navigateur requis)**
-
-```bash
-python -u tools/selftest_instance.py
-```
-
-Vérifie qu'un second programme ne peut pas lancer Chrome sur un profil déjà
-utilisé — et qu'un processus tué brutalement libère bien le verrou.
-
-> ⚠️ **N'ouvre qu'un seul programme à la fois sur `chrome_profile/`.** Un profil
-> Chrome ne peut être utilisé que par un seul Chrome. Si un second programme
-> (un outil de diagnostic, ou un second bot) tente de le lancer pendant que le
-> bot tourne, Chrome n'échoue pas franchement : il ouvre des fenêtres
-> `about:blank` dans la session existante et Playwright perd la connexion.
-> `dry_run.py` et `selftest_send.py` refusent donc de démarrer si le bot tourne
-> déjà, et `main.py` refuse de démarrer si un autre bot est en cours (verrou
-> `bot.lock`, libéré automatiquement par le système).
-
-**5. Pipeline complet sans rien envoyer**
-
-```bash
-python -u tools/dry_run.py           # résumé
-python -u tools/dry_run.py --debug   # logs détaillés
-```
-
-**6. Chaîne d'envoi (diagnostic, puis envoi réel)**
-
-```bash
-python -u tools/selftest_send.py                 # n'envoie RIEN
-python -u tools/selftest_send.py --confirm       # envoie réellement
-```
-
-**7. Entretien de la base**
-
-```bash
-python -u tools/db_cleanup.py                    # liste (ne supprime rien)
-python -u tools/db_cleanup.py --vides --tests --apply
-```
-
-**8. Re-cartographier le site si les sélecteurs cassent**
-
-```bash
-python -u tools/explore.py && python -u tools/explore3.py
-```
-
-> Les anciens tests unitaires synchrones (`tests/`) ont été supprimés :
-> ils ciblaient l'ancienne API synchrone et `requests`, remplacés depuis
-> par `ConversationManager` async et un client Ollama `aiohttp`.
-
----
-
-## ⚠️ Limitations
-
-- **DOM Leboncoin** — Leboncoin modifie régulièrement son HTML. Les sélecteurs reposent sur des attributs stables (`data-qa-id="message-bubble"`, `data-spark-component="textarea"`, `data-qa-id="message-send"`). En cas de changement, lance `python tools/explore.py` puis `python tools/explore3.py` pour re-cartographier le site.
-- **Session** — le profil `chrome_profile/` conserve la connexion. Si elle expire, le bot ouvre Chrome et attend que tu te reconnectes.
-- **Un seul Chrome par profil** — `chrome_profile/` ne peut être ouvert que par un seul Chrome à la fois. N'ouvre donc pas ton propre Chrome sur ce profil pendant que le bot tourne, et ne lance pas deux programmes à la fois : Chrome ouvrirait des fenêtres `about:blank` au lieu de démarrer. Le verrou `bot.lock` et le refus explicite des outils couvrent ce cas.
-- **Captcha** — le glissement automatique n'aboutit pas toujours (DataDome note aussi la dynamique souris et l'empreinte). Dans ce cas il faut intervenir à la main.
-- **Rôle acheteur/vendeur** — le bot ne répond qu'aux conversations où tu es le VENDEUR (« À propos de cet acheteur »). Les conversations où tu achètes sont ignorées.
-- **Offres chiffrées** — une offre automatique Leboncoin (« Accepter 400 € ») est signalée dans les logs mais **jamais** acceptée ni refusée automatiquement : décision humaine.
-- **Base de données** — elle n'est plus la source du contexte (le fil de la page l'est) : elle sert d'anti-doublon, de trace et de complément pour les messages que la page n'affiche plus. Tu peux donc la purger sans risque pour la pertinence des réponses, en gardant une sauvegarde (`conversations.db.bak-*`).
-- **Historique très long** — la page ne rend que les derniers messages et le bot ne remonte pas indéfiniment : au-delà de `MAX_HISTORY` (8 messages) l'ancienneté est résumée par son absence. Suffisant pour répondre juste au message en cours.
-- **Fichiers obsolètes** — `session.json` et `cookies.json` (ancienne méthode) ne sont plus utilisés.
-- **CPU et LLM** — sans GPU, chaque réponse prend 10-30s. C'est acceptable car le bot simule un humain avec des délais naturels
-
----
-
-## 📄 Licence
+## Licence
 
 MIT — voir [LICENSE](LICENSE)
