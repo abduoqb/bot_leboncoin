@@ -122,8 +122,8 @@ async def process() -> bool:
                                 "l'historique plus ancien.")
                 context, nb_envois = await db.build_context(
                     id_conv, texte, BASE_PERSONA, MAX_HISTORY, fil=hist_fil)
-                logger.info(f"🧠 Contexte : {len(hist_fil)} message(s) lu(s) dans la "
-                            f"page, {len(context) - 1 - len(hist_fil)} de la base.")
+                logger.info(f"🧠 Contexte : {len(context) - 2} tour(s) d'historique "
+                            f"({len(hist_fil)} lu(s) dans la page).")
 
                 # Assainir l'historique réinjecté : d'anciennes réponses fautives
                 # (« Bonjour Monsieur Co, ... ») sont en base et le modèle les

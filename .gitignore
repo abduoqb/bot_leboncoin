@@ -2,6 +2,7 @@
 session.json
 cookies.json
 conversations.db
+conversations.db.bak-*
 bot_state.json
 __pycache__/
 debugs

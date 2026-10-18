@@ -20,7 +20,8 @@ Bot Python qui répond automatiquement aux messages de tes annonces Leboncoin en
 - **Aucun message perdu** — un envoi non confirmé est retenté au scan suivant
 - **Pause nocturne** — inactif entre 1h et 7h du matin (configurable)
 - **Repos intelligent** — après 10 scans vides consécutifs, pause de 1h
-- **Contexte conversationnel** — SQLite async stocke l'historique de chaque conversation
+- **Contexte fidèle** — l'historique envoyé au modèle vient du **fil réellement lu dans la page**, pas de la base : les messages que tu as écrits à la main sont pris en compte, et aucune ancienne réponse fautive ne peut être réinjectée
+- **Contexte conversationnel** — SQLite async garde la trace et l'anti-doublon de chaque conversation
 - **Retry automatique** — 3 tentatives sur erreur réseau Ollama
 - **Logging complet** — console (UTF-8 forcé, sinon les emojis font planter les logs Windows) + fichier `bot.log` rotatif (5 Mo × 3 fichiers)
 - **Graceful shutdown** — Ctrl+C ferme proprement navigateur, session HTTP et base SQLite
@@ -45,6 +46,8 @@ bot_lbc/
 │   ├── dry_run.py         # Test À BLANC : lit + génère, sans rien envoyer
 │   ├── selftest_llm.py    # Boucle qualité : batterie de messages → catégorie + réponse
 │   ├── selftest_scan.py   # Vérifie qu'aucun fil déjà réglé n'est rouvert (0 navigateur)
+│   ├── selftest_context.py # Vérifie que le fil de la page fait foi (0 navigateur)
+│   ├── db_cleanup.py      # Entretien de conversations.db (liste, puis purge sur --apply)
 │   ├── selftest_send.py   # Diagnostic/envoi réel contrôlé sur UNE conversation
 │   ├── explore.py         # Cartographie la liste des conversations
 │   ├── explore2.py        # Anatomie d'un fil (bulles, conteneur, compositeur)
@@ -212,6 +215,34 @@ La mémoire des aperçus déjà vus est persistée dans `bot_state.json` : un
 redémarrage ne provoque donc **pas** un nouveau parcours complet de toutes les
 conversations.
 
+### D'où vient le contexte envoyé au LLM ?
+
+**Le fil lu dans la page fait foi** (`JS_THREAD` → `messages`). C'est lui qui
+contient la réalité : les messages que *tu* as écrits à la main, ceux des
+conversations qui existaient avant l'installation du bot, tout ce que la base
+n'a jamais vu. La base ne sert plus qu'à deux choses :
+
+| Rôle de la base | Détail |
+|-----------------|--------|
+| **Compléter** | La page ne rend que les derniers messages : `build_context()` aligne la base sur le premier message du fil et ne reprend que ceux qui précèdent. Rien n'est compté deux fois. |
+| **Anti-doublon & trace** | Après un envoi confirmé, `user` + `assistant` sont enregistrés. Si un envoi échoue, rien n'est enregistré et le scan suivant retente. |
+
+Conséquence : une base incomplète, ou qui contient d'anciennes réponses fautives
+(« Bonjour Monsieur Co… »), ne peut plus polluer la réponse. Le nombre de
+messages déjà envoyés est lui aussi déduit du fil, donc plus de « Bonjour »
+répété au démarrage parce que la base est vide.
+
+L'outil d'entretien liste et purge les lignes inutiles (simulation par défaut,
+sauvegarde horodatée avec `--apply`) :
+
+```bash
+python -u tools/db_cleanup.py                        # liste tout
+python -u tools/db_cleanup.py --vides --tests        # ce qui serait supprimé
+python -u tools/db_cleanup.py --vides --tests --apply
+python -u tools/db_cleanup.py --avant 2026-06-01     # vieux fils
+python -u tools/db_cleanup.py --ids a1b2,c3d4
+```
+
 **Fichiers impliqués :**
 
 | Fichier | Rôle |
@@ -221,10 +252,10 @@ conversations.
 | `rules.py` | Règles déterministes : conclusion, injection, disponibilité, décision de prix (`corrige_offre`) + `sanitize_reply()` |
 | `llm.py` | `classify_message()` (appel 1) + `generate_reply()` (appel 2) |
 | `main.py` | Orchestration : règles → classification → génération → envoi |
-| `leboncoin.py` | Lecture des conversations, détection du rôle, envoi vérifié |
+| `leboncoin.py` | Lecture des conversations et du fil (`JS_THREAD`), détection du rôle, envoi vérifié |
 | `human.py` | Mouvement souris Bézier, frappe clavier réaliste, scroll naturel |
 | `captcha.py` | Glissement « humain » du slider DataDome |
-| `conversation.py` | Historique SQLite async (contexte pour Ollama) |
+| `conversation.py` | Historique SQLite async ; `fil_vers_historique()` + `build_context()` (fil prioritaire) |
 
 ---
 
@@ -418,21 +449,37 @@ python -u tools/selftest_scan.py
 Vérifie qu'un fil déjà réglé n'est **jamais** rouvert : c'est cette logique qui
 évitait au bot de relire en boucle les conversations lues.
 
-**3. Pipeline complet sans rien envoyer**
+**3. Contexte (aucun navigateur requis)**
+
+```bash
+python -u tools/selftest_context.py
+```
+
+Vérifie que le contexte vient bien du fil de la page, que la base ne sert qu'à
+compléter, et qu'aucun message n'est compté deux fois au raccord.
+
+**4. Pipeline complet sans rien envoyer**
 
 ```bash
 python -u tools/dry_run.py           # résumé
 python -u tools/dry_run.py --debug   # logs détaillés
 ```
 
-**4. Chaîne d'envoi (diagnostic, puis envoi réel)**
+**5. Chaîne d'envoi (diagnostic, puis envoi réel)**
 
 ```bash
 python -u tools/selftest_send.py                 # n'envoie RIEN
 python -u tools/selftest_send.py --confirm       # envoie réellement
 ```
 
-**5. Re-cartographier le site si les sélecteurs cassent**
+**6. Entretien de la base**
+
+```bash
+python -u tools/db_cleanup.py                    # liste (ne supprime rien)
+python -u tools/db_cleanup.py --vides --tests --apply
+```
+
+**7. Re-cartographier le site si les sélecteurs cassent**
 
 ```bash
 python -u tools/explore.py && python -u tools/explore3.py
@@ -451,6 +498,8 @@ python -u tools/explore.py && python -u tools/explore3.py
 - **Captcha** — le glissement automatique n'aboutit pas toujours (DataDome note aussi la dynamique souris et l'empreinte). Dans ce cas il faut intervenir à la main.
 - **Rôle acheteur/vendeur** — le bot ne répond qu'aux conversations où tu es le VENDEUR (« À propos de cet acheteur »). Les conversations où tu achètes sont ignorées.
 - **Offres chiffrées** — une offre automatique Leboncoin (« Accepter 400 € ») est signalée dans les logs mais **jamais** acceptée ni refusée automatiquement : décision humaine.
+- **Base de données** — elle n'est plus la source du contexte (le fil de la page l'est) : elle sert d'anti-doublon, de trace et de complément pour les messages que la page n'affiche plus. Tu peux donc la purger sans risque pour la pertinence des réponses, en gardant une sauvegarde (`conversations.db.bak-*`).
+- **Historique très long** — la page ne rend que les derniers messages et le bot ne remonte pas indéfiniment : au-delà de `MAX_HISTORY` (8 messages) l'ancienneté est résumée par son absence. Suffisant pour répondre juste au message en cours.
 - **Fichiers obsolètes** — `session.json` et `cookies.json` (ancienne méthode) ne sont plus utilisés.
 - **CPU et LLM** — sans GPU, chaque réponse prend 10-30s. C'est acceptable car le bot simule un humain avec des délais naturels
 

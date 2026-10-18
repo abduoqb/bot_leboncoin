@@ -35,7 +35,7 @@ if "--debug" in sys.argv:
 from config import (  # noqa: E402
     PROMPTS, BASE_PERSONA, REPONSES_STATIQUES, NOMS_A_NEUTRALISER, VENTE,
 )
-from conversation import ConversationManager  # noqa: E402
+from conversation import ConversationManager, fil_vers_historique  # noqa: E402
 from llm import classify_message, generate_reply, init_session, close_session  # noqa: E402
 from leboncoin import LeboncoinClient  # noqa: E402
 from rules import (  # noqa: E402
@@ -84,7 +84,11 @@ async def main():
             if cat in REPONSES_STATIQUES:
                 print(f"  RÉPONSE (statique) : {REPONSES_STATIQUES[cat]}")
             else:
-                ctx, nb = await db.build_context(m["id_conv"], m["texte"], BASE_PERSONA, 8)
+                hist_fil = fil_vers_historique(m.get("messages"))
+                print(f"  🧠 {len(hist_fil)} message(s) lu(s) dans le fil de la page"
+                      + (" (base utilisée en complément)" if m.get("fil_tronque") else ""))
+                ctx, nb = await db.build_context(
+                    m["id_conv"], m["texte"], BASE_PERSONA, 8, fil=hist_fil)
                 for h in ctx[1:-1]:
                     if h.get("role") == "assistant":
                         h["content"] = sanitize_reply(
