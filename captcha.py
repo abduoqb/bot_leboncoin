@@ -10,7 +10,8 @@ Ce module tente de résoudre ce slider de façon HUMAINE :
   - jitter vertical et léger tremblement,
   - léger dépassement puis correction avant relâchement,
   - hésitation après l'appui, maintien avant le relâchement,
-  - durée totale ~0,75-1,4 s (cible constructeur DataDome : 0,6-1,4 s).
+  - durée totale tirée largement (~0,65-1,9 s) et vitesse NON monotone
+    (le profil d'accélération et de petites hésitations varient à chaque geste).
 
 Succès détecté par (dans l'ordre de fiabilité) :
   1. le cookie `datadome` a CHANGÉ de valeur,
@@ -25,8 +26,16 @@ Leboncoin. Aucune tentative de contournement vis-à-vis d'un tiers.
 """
 
 import asyncio
+import json
 import logging
+import math
+import os
 import random
+import re
+import time
+from datetime import datetime
+
+from config import DEBUG_SCREENSHOTS
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +47,59 @@ IFRAME_SEL = (
 FRAME_URL_HINT = "captcha-delivery.com/captcha"
 
 # Poignée à glisser : `#captcha-container .slider` est le seul sélecteur public
-# vérifié. On garde des replis au cas où DataDome change son markup.
+# vérifié. Les replis ci-dessous restent SPÉCIFIQUES. Les sélecteurs génériques
+# (`.slider`, `[class*='slider']`) ne sont tentés qu'à l'intérieur d'une frame
+# déjà identifiée comme celle du captcha (URL contenant « captcha »), jamais
+# sur une frame quelconque (risque de cliquer une autre « slider » de la page).
 HANDLE_SELECTORS = [
     "#captcha-container .slider",
     "#captcha-container [class*='slider']",
+    "[role='slider']",
+]
+HANDLE_SELECTORS_FRAME_CAPTCHA = [
     ".slider",
     "[class*='slider']",
-    "[role='slider']",
-    "[class*='handle']",
 ]
+
+# ── Détection UNIQUE du captcha (partagée avec leboncoin.JS_STATE) ───────────
+# Un seul jeu de motifs : DOM (iframe / #cmsg), variable DataDome `dd.t == 'c'`
+# et texte de l'invite. Injecté dans le JS par json.dumps (échappement sûr).
+CAPTCHA_DOM_SELECTOR = IFRAME_SEL + ", #cmsg"
+CAPTCHA_TEXT_PATTERN = (
+    r"Faites glisser vers la droite|glissez vers la droite|"
+    r"s'adresse bien . vous|un robot est sur (?:ce site|le m)"
+)
+CAPTCHA_JS_EXPR = (
+    "(() => {"
+    " if (window.dd && String(window.dd.t) === 'c') return true;"
+    f" if (document.querySelector({json.dumps(CAPTCHA_DOM_SELECTOR)})) return true;"
+    " const b = (document.body && document.body.innerText) || '';"
+    f" return new RegExp({json.dumps(CAPTCHA_TEXT_PATTERN)}, 'i').test(b);"
+    " })()"
+)
+
+
+def _handle_selectors(frame) -> list:
+    sels = list(HANDLE_SELECTORS)
+    if "captcha" in (getattr(frame, "url", "") or "").lower():
+        sels += HANDLE_SELECTORS_FRAME_CAPTCHA
+    return sels
+
+
+async def debug_dump_page(page, label: str = "captcha_echec"):
+    """Capture d'écran + HTML dans debugs/ (si DEBUG_SCREENSHOTS)."""
+    if not DEBUG_SCREENSHOTS:
+        return
+    safe = re.sub(r"[^a-z0-9_]", "_", label.lower())
+    dbg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debugs")
+    try:
+        os.makedirs(dbg, exist_ok=True)
+        await page.screenshot(path=os.path.join(dbg, f"debug_{safe}.png"), full_page=True)
+        with open(os.path.join(dbg, f"debug_{safe}.html"), "w", encoding="utf-8") as f:
+            f.write(await page.content())
+        logger.info(f"📸 Debug dump : debugs/debug_{safe}.png + .html")
+    except Exception as e:
+        logger.warning(f"Debug dump captcha impossible : {e}")
 
 
 async def datadome_cookie(context) -> str | None:
@@ -77,21 +130,15 @@ async def is_captcha_present(page) -> bool:
     except Exception:
         pass
     try:
-        return await page.evaluate(
-            """() => {
-                if (window.dd && String(window.dd.t) === 'c') return true;
-                const b = document.body ? document.body.innerText : '';
-                return /Faites glisser vers la droite|glissez vers la droite|un robot est sur ce site/i.test(b);
-            }"""
-        )
+        return bool(await page.evaluate("() => " + CAPTCHA_JS_EXPR))
     except Exception:
         return False
 
 
 async def _find_slider_frame(page, timeout_s: float = 12.0):
     """Attend et renvoie la frame du captcha portant une poignée visible."""
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while asyncio.get_event_loop().time() < deadline:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         frames = list(page.frames)
         # 1) par URL (le plus déterministe)
         for fr in frames:
@@ -118,7 +165,7 @@ async def _find_slider_frame(page, timeout_s: float = 12.0):
 
 
 async def _has_handle(frame) -> bool:
-    for sel in HANDLE_SELECTORS:
+    for sel in _handle_selectors(frame):
         try:
             loc = frame.locator(sel)
             if await loc.count() and await loc.first.is_visible():
@@ -130,7 +177,7 @@ async def _has_handle(frame) -> bool:
 
 async def _find_handle(frame):
     """Renvoie (locator, selector) de la poignée, ou (None, None)."""
-    for sel in HANDLE_SELECTORS:
+    for sel in _handle_selectors(frame):
         try:
             loc = frame.locator(sel)
             n = await loc.count()
@@ -148,10 +195,11 @@ async def _find_handle(frame):
 
 async def _track_box(frame, handle):
     """Boîte de la piste = parent de la poignée (`slider.parentElement`)."""
-    for expr in ("xpath=..", "xpath=..", "xpath=.."):
+    node = handle
+    for _ in range(3):                 # on remonte réellement d'un niveau à chaque tour
         try:
-            parent = handle.locator(expr)
-            box = await parent.bounding_box()
+            node = node.locator("xpath=..")
+            box = await node.bounding_box()
             if box and box["width"] > 30:
                 return box
         except Exception:
@@ -180,18 +228,29 @@ async def _human_drag(page, start, end, total_ms: int):
     await page.mouse.down()
     await asyncio.sleep(random.uniform(0.10, 0.30))   # hésitation après appui
 
-    n = random.randint(45, 90)
+    n = random.randint(40, 95)
     overshoot = random.uniform(6, 16)
     span = (x1 - x0) + overshoot
+    # Profil de position : mélange aléatoire de smoothstep et d'une courbe en
+    # puissance (toujours 0→1, croissant) + ondulation de vitesse non monotone.
+    w = random.uniform(0.15, 0.55)
+    g = random.uniform(0.8, 1.5)
+    phase = random.uniform(0, 2 * math.pi)
+    freq = random.uniform(1.0, 3.0)
+    amp = random.uniform(0.15, 0.4)
     x = x0
     for i in range(1, n + 1):
         t = i / n
-        # smoothstep : accélération puis décélération naturelles
-        ease = t * t * (3 - 2 * t)
+        smooth = t * t * (3 - 2 * t)
+        ease = (1 - w) * smooth + w * (t ** g)
         x = x0 + span * ease
         y = y0 + (y1 - y0) * ease + random.uniform(-2.0, 2.0)
         await page.mouse.move(x, y)
-        await asyncio.sleep((total_ms / n) / 1000.0 * random.uniform(0.6, 1.4))
+        vitesse = 1 + amp * math.sin(phase + 2 * math.pi * freq * t)
+        pas = (total_ms / n) / 1000.0 * random.uniform(0.6, 1.4) / max(vitesse, 0.4)
+        await asyncio.sleep(pas)
+        if random.random() < 0.05:               # micro-hésitation
+            await asyncio.sleep(random.uniform(0.04, 0.14))
 
     # correction : on revient sur la cible finale
     back = overshoot
@@ -208,8 +267,16 @@ async def _human_drag(page, start, end, total_ms: int):
 async def solve_slider(page, attempts: int = 2, timeout_s: float = 30.0) -> bool:
     """
     Tente de résoudre le slider (1-2 tentatives). Renvoie True si le captcha
-    disparaît / le cookie `datadome` change.
+    disparaît / le cookie `datadome` change. À chaque échec, vide la page dans
+    debugs/ (si DEBUG_SCREENSHOTS).
     """
+    ok = await _solve_slider_impl(page, attempts, timeout_s)
+    if not ok:
+        await debug_dump_page(page, "captcha_slider_echec")
+    return ok
+
+
+async def _solve_slider_impl(page, attempts: int, timeout_s: float) -> bool:
     if not await is_captcha_present(page):
         return True
 
@@ -222,7 +289,7 @@ async def solve_slider(page, attempts: int = 2, timeout_s: float = 30.0) -> bool
     before_cookie = await datadome_cookie(context)
 
     for attempt in range(1, attempts + 1):
-        logger.info(f"🧩 Captcha détecté → glissement automatique (tentative {attempt}/{attempts})…")
+        logger.info(f"🧩 Captcha détecté à {datetime.now():%H:%M:%S} → glissement automatique (tentative {attempt}/{attempts})…")
 
         frame = await _find_slider_frame(page, timeout_s=min(timeout_s / 2, 12))
         if frame is None:
@@ -255,7 +322,7 @@ async def solve_slider(page, attempts: int = 2, timeout_s: float = 30.0) -> bool
         )
 
         try:
-            await _human_drag(page, start, end, total_ms=random.randint(750, 1400))
+            await _human_drag(page, start, end, total_ms=random.randint(650, 1900))
         except Exception as e:
             logger.warning(f"🧩 Glissement en échec : {e}")
             try:

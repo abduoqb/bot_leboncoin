@@ -72,6 +72,11 @@ CAPTCHA_WAIT_SECONDS = 300
 RESTART_COOLDOWN_SECONDS = 180
 MAX_RESTART_ESSAIS = 3         # au-delà, on attend le cooldown
 
+# Captchas : fenêtre glissante + pauses (évite de s'acharner et d'aggraver le blocage)
+CAPTCHA_FENETRE_SECONDS = 3600     # fenêtre glissante de comptage (1 h)
+CAPTCHA_MAX_PAR_HEURE = 4          # au-delà : pause longue (plus aucun scan)
+CAPTCHA_PAUSE_LONGUE_SECONDS = 5400  # durée de la pause longue (1 h 30)
+CAPTCHA_AUTO_MAX_PAR_HEURE = 2     # glissements AUTOMATIQUES max / fenêtre, puis attente humaine
 
 MAX_HISTORY = 8
 HEADLESS = False       # False = navigateur visible

@@ -39,8 +39,13 @@ from config import (
     CAPTCHA_WAIT_SECONDS,
     RESTART_COOLDOWN_SECONDS,
     MAX_RESTART_ESSAIS,
+    CAPTCHA_FENETRE_SECONDS,
+    CAPTCHA_MAX_PAR_HEURE,
+    CAPTCHA_PAUSE_LONGUE_SECONDS,
+    CAPTCHA_AUTO_MAX_PAR_HEURE,
 )
 import human as H
+from captcha import CAPTCHA_JS_EXPR
 
 logger = logging.getLogger(__name__)
 
@@ -124,17 +129,23 @@ SEND_BTN = '[data-qa-id="message-send"]'
 # ── JS ───────────────────────────────────────────────────────────────────────
 
 # État de la page : captcha DataDome ? page de connexion ?
+# - `captcha` : motifs partagés avec captcha.is_captcha_present (CAPTCHA_JS_EXPR).
+# - `login`   : vrai SEULEMENT sur l'URL d'authentification (auth.leboncoin.fr,
+#   /login, /connexion) ou dans un VRAI formulaire de connexion (un <form> qui
+#   contient un champ mot de passe ET un identifiant e-mail/utilisateur). Un
+#   simple input[type=password] (modale de confirmation, etc.) ne suffit plus ;
+#   la page de connexion réelle reste détectée par son URL.
 JS_STATE = r"""() => {
-  const body = (document.body && document.body.innerText) || '';
+  const formConnexion = [...document.querySelectorAll('form')].some(f =>
+    f.querySelector('input[type="password"]')
+    && f.querySelector('input[type="email"], input[name*="mail" i], input[name*="user" i], input[autocomplete="username"]'));
   return {
     url: location.href,
-    captcha: !!document.querySelector(
-        'iframe[src*="captcha-delivery"], iframe[title*="CAPTCHA"], #cmsg')
-      || /Faites glisser vers la droite|s'adresse bien . vous|un robot est sur le m/i.test(body),
-    login: !!document.querySelector('input[type="password"]')
-      || /auth\.leboncoin\.fr/.test(location.href),
+    captcha: __CAPTCHA_EXPR__,
+    login: /auth\.leboncoin\.fr|\/(login|connexion)(\/|\?|$)/.test(location.href)
+      || formConnexion,
   };
-}"""
+}""".replace("__CAPTCHA_EXPR__", CAPTCHA_JS_EXPR)
 
 # Liste des conversations + détection du non-lu + aperçu du dernier message
 JS_LIST = r"""() => {
@@ -300,6 +311,7 @@ class LeboncoinClient:
         self._is_cdp = False
         self._shutdown = False
         self._current_thread_url = None
+        self._init_captcha_state()
 
         # ── Antirebond de redémarrage ────────────────────────────────────────
         # Si Chrome refuse de démarrer (profil déjà ouvert), chaque tentative
@@ -532,6 +544,56 @@ class LeboncoinClient:
                 pass
             return False
 
+    # ── Compteurs captcha (fenêtre glissante, pause longue) ───────────────────
+
+    def _init_captcha_state(self):
+        self._captcha_times = []       # horodatages (monotonic) des captchas vus
+        self._auto_times = []          # horodatages des glissements automatiques
+        self._pause_captcha_jusqu = 0.0
+        self._scan_bloque = False      # le scan courant doit s'arrêter (captcha/connexion)
+        self._captcha_fil = False      # un captcha a été vu dans le fil en lecture
+
+    @staticmethod
+    def _purger(liste: list, now: float):
+        limite = now - CAPTCHA_FENETRE_SECONDS
+        liste[:] = [t for t in liste if t > limite]
+
+    def _en_pause_captcha(self, now: float = None) -> bool:
+        """Pause longue en cours ? À son terme, les compteurs sont remis à zéro."""
+        now = time.monotonic() if now is None else now
+        if not self._pause_captcha_jusqu:
+            return False
+        if now >= self._pause_captcha_jusqu:
+            self._pause_captcha_jusqu = 0.0
+            self._captcha_times.clear()
+            self._auto_times.clear()
+            return False
+        return True
+
+    def _noter_captcha(self, now: float = None) -> bool:
+        """Compte un captcha dans la fenêtre glissante. Renvoie True si le seuil
+        est dépassé (la pause longue est alors armée)."""
+        now = time.monotonic() if now is None else now
+        self._purger(self._captcha_times, now)
+        self._captcha_times.append(now)
+        n = len(self._captcha_times)
+        logger.info(f"🧩 Captcha à {time.strftime('%H:%M:%S')} "
+                    f"({n}/{CAPTCHA_MAX_PAR_HEURE} dans la fenêtre)")
+        if n > CAPTCHA_MAX_PAR_HEURE:
+            self._pause_captcha_jusqu = now + CAPTCHA_PAUSE_LONGUE_SECONDS
+            logger.error(
+                f"🛑 {n} captchas en {CAPTCHA_FENETRE_SECONDS // 60} min : pause longue de "
+                f"{CAPTCHA_PAUSE_LONGUE_SECONDS // 60} min (aucun scan), pour ne pas "
+                f"aggraver le blocage.")
+            return True
+        return False
+
+    def _auto_autorise(self, now: float = None) -> bool:
+        """Un glissement automatique de plus est-il permis dans la fenêtre ?"""
+        now = time.monotonic() if now is None else now
+        self._purger(self._auto_times, now)
+        return len(self._auto_times) < CAPTCHA_AUTO_MAX_PAR_HEURE
+
     # ── Détection captcha / connexion ─────────────────────────────────────────
 
     async def _state(self) -> dict:
@@ -557,19 +619,40 @@ class LeboncoinClient:
         2) En cas d'échec seulement, on met le bot en pause et on attend
            une intervention humaine.
         """
-        if "captcha" in raison.lower():
+        est_captcha = "captcha" in raison.lower()
+        if est_captcha:
+            if self._en_pause_captcha():
+                logger.warning("⏸️ Pause longue anti-captcha en cours : aucune action.")
+                self._scan_bloque = True
+                return False
             try:
                 from captcha import is_captcha_present, solve_slider
-                # On ne tente le glissement QUE si un vrai captcha est affiché
-                # (sinon, ex. page de connexion, on doit attendre l'humain).
+                # On ne compte / tente le glissement QUE si un vrai captcha est
+                # affiché (sinon, ex. page de connexion, on attend l'humain).
                 if await is_captcha_present(self.page):
-                    if await solve_slider(self.page):
-                        logger.info("🤖 Captcha franchi automatiquement.")
-                        if "/messages" not in self.page.url:
-                            await self._goto(LBC_MESSAGES)
-                        return True
+                    if self._noter_captcha():
+                        self._scan_bloque = True
+                        return False
+                    if not self._auto_autorise():
+                        logger.warning(
+                            f"🧩 Déjà {CAPTCHA_AUTO_MAX_PAR_HEURE} glissements automatiques "
+                            f"sur la fenêtre : attente humaine directe.")
+                    else:
+                        self._auto_times.append(time.monotonic())
+                        if await solve_slider(self.page):
+                            logger.info("🤖 Captcha franchi automatiquement.")
+                            if "/messages" not in self.page.url:
+                                await self._goto(LBC_MESSAGES)
+                            return True
             except Exception as e:
                 logger.warning(f"Résolution auto du captcha impossible : {e}")
+
+        if HEADLESS:
+            logger.error(
+                f"❌ {raison} : navigateur HEADLESS, personne ne peut intervenir. "
+                f"Passe HEADLESS=False dans config.py pour pouvoir résoudre à la main.")
+            self._scan_bloque = True
+            return False
 
         logger.warning(f"⏸️ {raison} — intervention humaine requise.")
         print("\n" + "=" * 62)
@@ -584,6 +667,7 @@ class LeboncoinClient:
         last_log = -15
         for elapsed in range(0, CAPTCHA_WAIT_SECONDS, 3):
             if self._shutdown:
+                self._scan_bloque = True
                 return False
             st = await self._state()
             if not st.get("login") and not st.get("captcha"):
@@ -597,6 +681,7 @@ class LeboncoinClient:
             await asyncio.sleep(3)
 
         logger.error("❌ Délai dépassé : aucune intervention humaine détectée.")
+        self._scan_bloque = True
         return False
 
     async def ensure_ready(self) -> bool:
@@ -644,7 +729,10 @@ class LeboncoinClient:
         # Après résolution : on revient sur la liste et on re-vérifie
         await self._goto(LBC_MESSAGES)
         st = await self._state()
-        return not st.get("captcha") and not st.get("login")
+        ok = not st.get("captcha") and not st.get("login")
+        if not ok:
+            self._scan_bloque = True
+        return ok
 
     async def _load_all_conversations(self, cible: str = None) -> dict:
         """Lit la liste en la faisant défiler, comme le ferait une personne.
@@ -821,6 +909,12 @@ class LeboncoinClient:
         from config import MAX_CONVS_PER_SCAN
         conversations = []
         self._shutdown = False
+        self._scan_bloque = False
+
+        if self._en_pause_captcha():
+            reste = max(0, int(self._pause_captcha_jusqu - time.monotonic()))
+            logger.warning(f"⏸️ Pause anti-captcha : scan sauté (encore ~{reste // 60} min).")
+            return []
 
         if not await self._ensure_on_messages():
             return []
@@ -876,7 +970,20 @@ class LeboncoinClient:
             id_conv = conv_url.rstrip("/").split("/")[-1]
 
             inspected += 1
+            self._captcha_fil = False
             thread = await self._read_thread(conv_url)
+
+            # Captcha / connexion non résolu : on ARRÊTE le scan (sinon chaque
+            # fil suivant redéclencherait un captcha). Ce n'est pas un échec du
+            # fil : ni _noter_echec, ni aperçu « vu » → il reste candidat.
+            if thread is None and self._scan_bloque:
+                logger.error("🛑 Captcha/connexion non résolu : scan arrêté, "
+                             "les fils restants seront relus au prochain scan.")
+                break
+            if thread is None and self._captcha_fil:
+                logger.info(f"🧩 Captcha résolu pendant la lecture de {id_conv} : "
+                            f"fil relu au prochain scan (pas un échec).")
+                continue
 
             # Le fil a bien été ouvert : l'aperçu est désormais « vu ». S'il n'y
             # a rien à répondre il ne sera plus rouvert ; s'il reste une réponse
@@ -989,6 +1096,8 @@ class LeboncoinClient:
         if st.get("captcha"):
             if DEBUG_SCREENSHOTS:
                 await self.debug_dump_page(f"captcha_thread_{conv_url.split('/')[-1]}")
+            self._captcha_fil = True
+            # Échec/timeout propagé via self._scan_bloque (posé par _wait_human).
             await self._wait_human("Captcha détecté dans une conversation")
             return None
         return data
