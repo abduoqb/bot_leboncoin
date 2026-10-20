@@ -54,7 +54,8 @@ def _verrouille(fd) -> bool:
         else:
             _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         return True
-    except OSError:
+    except OSError as _err:
+        logger.debug("Verrou deja pris par une autre instance : %s", type(_err).__name__)
         return False
 
 
@@ -65,8 +66,8 @@ def _deverrouille(fd):
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             _fcntl.flock(fd, _fcntl.LOCK_UN)
-    except Exception:
-        pass
+    except Exception as _err:
+        logger.debug("Deverrouillage du fichier impossible : %s", type(_err).__name__)
 
 
 def acquerir(chemin: str = None) -> bool:
@@ -87,8 +88,8 @@ def acquerir(chemin: str = None) -> bool:
     try:
         os.lseek(fd, _OFFSET_PID, os.SEEK_SET)
         os.write(fd, f"{os.getpid()}\n".encode())
-    except Exception:
-        pass
+    except Exception as _err:
+        logger.debug("Ecriture du PID dans le fichier de verrou impossible : %s", type(_err).__name__)
     return True
 
 
@@ -102,6 +103,7 @@ def occupe(chemin: str = None) -> bool:
     try:
         fd = os.open(chemin, os.O_CREAT | os.O_RDWR)
     except OSError:
+        logger.warning("Ouverture du fichier de verrou impossible", exc_info=True)
         return False
     try:
         if _verrouille(fd):
@@ -124,7 +126,8 @@ def detenteur(chemin: str = None):
             f.seek(_OFFSET_PID)
             v = f.read(32).decode(errors="replace").strip()
         return v or None
-    except Exception:
+    except Exception as _err:
+        logger.debug("Lecture du PID dans le fichier de verrou impossible : %s", type(_err).__name__)
         return None
 
 
@@ -138,13 +141,13 @@ def liberer():
     try:
         os.lseek(_fd, _OFFSET_PID, os.SEEK_SET)
         os.write(_fd, b" " * 24)
-    except Exception:
-        pass
+    except Exception as _err:
+        logger.debug("Effacement du PID dans le fichier de verrou impossible : %s", type(_err).__name__)
     _deverrouille(_fd)
     try:
         os.close(_fd)
-    except Exception:
-        pass
+    except Exception as _err:
+        logger.debug("Fermeture du fichier de verrou impossible : %s", type(_err).__name__)
     _fd = None
 
 

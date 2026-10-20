@@ -107,8 +107,8 @@ async def datadome_cookie(context) -> str | None:
         for c in await context.cookies():
             if c.get("name") == "datadome":
                 return c.get("value")
-    except Exception:
-        pass
+    except Exception as _err:
+        logger.debug("Lecture du cookie datadome impossible : %s", type(_err).__name__)
     return None
 
 
@@ -118,7 +118,8 @@ async def _banned(page) -> bool:
         return bool(await page.evaluate(
             "() => !!(window.dd && String(window.dd.t) === 'bv')"
         ))
-    except Exception:
+    except Exception as _err:
+        logger.debug("Test de la bascule captcha (dd.t) echoue : %s", type(_err).__name__)
         return False
 
 
@@ -127,11 +128,12 @@ async def is_captcha_present(page) -> bool:
     try:
         if await page.query_selector(IFRAME_SEL):
             return True
-    except Exception:
-        pass
+    except Exception as _err:
+        logger.debug("Recherche de l'iframe captcha echouee : %s", type(_err).__name__)
     try:
         return bool(await page.evaluate("() => " + CAPTCHA_JS_EXPR))
-    except Exception:
+    except Exception as _err:
+        logger.debug("Evaluation JS de detection captcha echouee : %s", type(_err).__name__)
         return False
 
 
@@ -154,8 +156,8 @@ async def _find_slider_frame(page, timeout_s: float = 12.0):
                 if fr and await _has_handle(fr):
                     logger.info(f"🌐 Frame captcha (iframe) : {(fr.url or '')[:80]}")
                     return fr
-        except Exception:
-            pass
+        except Exception as _err:
+            logger.debug("Inspection d'une frame captcha echouee : %s", type(_err).__name__)
         # 3) n'importe quelle frame qui contient une poignée
         for fr in frames:
             if "captcha" in (fr.url or "").lower() and await _has_handle(fr):
@@ -170,7 +172,8 @@ async def _has_handle(frame) -> bool:
             loc = frame.locator(sel)
             if await loc.count() and await loc.first.is_visible():
                 return True
-        except Exception:
+        except Exception as _err:
+            logger.debug("Test de visibilite du captcha echoue : %s", type(_err).__name__)
             continue
     return False
 
@@ -188,7 +191,8 @@ async def _find_handle(frame):
                 box = await el.bounding_box()
                 if box and box["width"] >= 4 and box["height"] >= 4:
                     return el, sel
-        except Exception:
+        except Exception as _err:
+            logger.debug("Mesure d'un element captcha echouee : %s", type(_err).__name__)
             continue
     return None, None
 
@@ -202,7 +206,8 @@ async def _track_box(frame, handle):
             box = await node.bounding_box()
             if box and box["width"] > 30:
                 return box
-        except Exception:
+        except Exception as _err:
+            logger.debug("Mesure de la boite captcha echouee (arret) : %s", type(_err).__name__)
             break
     # repli : boîte du #captcha-container
     for sel in ("#captcha-container", "body"):
@@ -210,7 +215,8 @@ async def _track_box(frame, handle):
             box = await frame.locator(sel).first.bounding_box()
             if box and box["width"] > 30:
                 return box
-        except Exception:
+        except Exception as _err:
+            logger.debug("Mesure du conteneur captcha echouee : %s", type(_err).__name__)
             continue
     return None
 
@@ -327,8 +333,8 @@ async def _solve_slider_impl(page, attempts: int, timeout_s: float) -> bool:
             logger.warning(f"🧩 Glissement en échec : {e}")
             try:
                 await page.mouse.up()
-            except Exception:
-                pass
+            except Exception as _err:
+                logger.debug("Relachement de la souris apres echec du glisse impossible : %s", type(_err).__name__)
             return False
 
         # ── Confirmation du succès (~10 s max) ───────────────────────────────

@@ -53,15 +53,16 @@ def reset_mouse(page=None):
         return
     try:
         _mouse_pos.pop(page, None)
-    except TypeError:
-        pass
+    except TypeError as _err:
+        logger.debug("Position souris: page non hachable (reset ignore) : %s", type(_err).__name__)
     _fallback_pos.pop(id(page), None)
 
 
 def _get_pos(page):
     try:
         pos = _mouse_pos.get(page)
-    except TypeError:
+    except TypeError as _err:
+        logger.debug("Position souris: page non hachable (lecture) : %s", type(_err).__name__)
         pos = None
     return pos if pos is not None else _fallback_pos.get(id(page))
 
@@ -69,7 +70,8 @@ def _get_pos(page):
 def _set_pos(page, x, y):
     try:
         _mouse_pos[page] = (x, y)
-    except TypeError:
+    except TypeError as _err:
+        logger.debug("Position souris: page non hachable (repli par id) : %s", type(_err).__name__)
         _fallback_pos[id(page)] = (x, y)
 
 
@@ -80,8 +82,8 @@ async def _viewport(page) -> tuple:
         w, h = float(vp["w"]), float(vp["h"])
         if w > 0 and h > 0:
             return w, h
-    except Exception:
-        pass
+    except Exception as _err:
+        logger.debug("Taille du viewport illisible (valeur par defaut) : %s", type(_err).__name__)
     return DEFAULT_VIEWPORT
 
 
@@ -113,8 +115,8 @@ async def wait_page_load(page, extra_pause: float = None):
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=10000)
-    except Exception:
-        pass  # pas bloquant
+    except Exception as _err:
+        logger.debug("wait_for_load_state(domcontentloaded) a echoue : %s", type(_err).__name__)
     delay = extra_pause if extra_pause is not None else random.uniform(1.5, 3.0)
     await asyncio.sleep(delay)
 
@@ -228,7 +230,8 @@ async def human_click(page, element) -> bool:
     """
     try:
         box = await element.bounding_box()
-    except Exception:
+    except Exception as _err:
+        logger.debug("bounding_box illisible : %s", type(_err).__name__)
         box = None
 
     if box:
@@ -330,8 +333,8 @@ async def stray_move(page, n: int = 1):
                 random.uniform(100, max(200, vp[0] - 100)),
                 random.uniform(100, max(200, vp[1] - 200)),
             )
-        except Exception:
-            pass
+        except Exception as _err:
+            logger.debug("Deplacement de souris de l'agitation echoue : %s", type(_err).__name__)
         await asyncio.sleep(random.uniform(0.15, 0.5))
 
 

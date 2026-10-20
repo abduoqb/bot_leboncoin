@@ -141,6 +141,7 @@ class LeboncoinClient:
                     try:
                         self._pending[str(k)] = max(0, int(v))
                     except (TypeError, ValueError):
+                        logger.warning("Etat: compteur 'pending' invalide ignore (remis a 0)", exc_info=True)
                         self._pending[str(k)] = 0
             for cle, cible in (("ignorees", self._ignorees), ("settled", self._settled)):
                 val = data.get(cle) or []
@@ -150,7 +151,7 @@ class LeboncoinClient:
                         f"{len(self._pending)} en attente, {len(self._ignorees)} ignorée(s), "
                         f"{len(self._settled)} réglée(s)")
         except FileNotFoundError:
-            pass
+            logger.debug("Etat: aucun fichier d'etat (premier lancement)")
         except Exception as e:
             logger.warning(f"Mémoire illisible ({e}) → on repart de zéro.")
 
@@ -169,15 +170,15 @@ class LeboncoinClient:
                 f.flush()
                 try:
                     os.fsync(f.fileno())
-                except OSError:
-                    pass
+                except OSError as _err:
+                    logger.debug("Etat: fsync du fichier temporaire impossible : %s", type(_err).__name__)
             os.replace(tmp, _STATE_FILE)
         except Exception as e:
             logger.warning(f"Sauvegarde de la mémoire impossible : {e}")
             try:
                 os.remove(tmp)
-            except OSError:
-                pass
+            except OSError as _err:
+                logger.debug("Etat: suppression du fichier temporaire impossible : %s", type(_err).__name__)
 
     def _set_preview(self, href: str, preview: str):
         """Enregistre un aperçu en ordre LRU (pop puis réinsertion en fin)."""
@@ -287,8 +288,8 @@ class LeboncoinClient:
             if self.page and not self.page.is_closed():
                 await self.page.evaluate("() => 1")
                 return True
-        except Exception:
-            pass
+        except Exception as _err:
+            logger.debug("Ping de la page echoue (page consideree comme morte) : %s", type(_err).__name__)
 
         # Antirebond : si les redémarrages viennent d'échouer plusieurs fois
         # d'affilée (profil Chrome déjà ouvert, navigateur récalcitrant), on
@@ -309,8 +310,8 @@ class LeboncoinClient:
         self._dernier_redemarrage = time.monotonic()
         try:
             await self.close()
-        except Exception:
-            pass
+        except Exception as _err:
+            logger.debug("Fermeture du navigateur avant redemarrage echouee : %s", type(_err).__name__)
         # Réinitialise l'état VOLATIL seulement : la mémoire des aperçus reste
         # valable (elle est persistée), inutile de tout re-parcourir.
         self._shutdown = False
@@ -329,8 +330,8 @@ class LeboncoinClient:
             # nettoyage, chaque cycle laisserait un process de plus derrière lui.
             try:
                 await self.close()
-            except Exception:
-                pass
+            except Exception as _err:
+                logger.debug("Fermeture du navigateur apres echec de demarrage echouee : %s", type(_err).__name__)
             return False
 
     # ── Compteurs captcha (fenêtre glissante, pause longue) ───────────────────
@@ -391,6 +392,7 @@ class LeboncoinClient:
         try:
             return await self.page.evaluate(JS_STATE)
         except Exception:
+            logger.warning("Lecture de l'etat de la page impossible (captcha/login suppose)", exc_info=True)
             return {"url": self.page.url, "captcha": True, "login": True}
 
     async def _goto(self, url: str):
@@ -917,6 +919,7 @@ class LeboncoinClient:
         try:
             return await self.page.evaluate(JS_THREAD)
         except Exception:
+            logger.warning("Lecture du fil de discussion impossible", exc_info=True)
             return None
 
     async def _send_message_inner(self, id_conv: str, texte: str,
@@ -968,7 +971,8 @@ class LeboncoinClient:
             # Contrôle du contenu réellement présent dans le champ
             try:
                 val = (await champ.input_value()).strip()
-            except Exception:
+            except Exception as _err:
+                logger.debug("Lecture du champ de saisie impossible : %s", type(_err).__name__)
                 val = ""
             if val != texte.strip():
                 logger.warning(
@@ -1002,7 +1006,8 @@ class LeboncoinClient:
             try:
                 before = await self.page.evaluate(JS_THREAD)
                 prev_count = (before or {}).get("count", 0)
-            except Exception:
+            except Exception as _err:
+                logger.debug("Lecture du compteur de messages avant envoi impossible : %s", type(_err).__name__)
                 prev_count = 0
 
             await H.human_click(self.page, btn)
@@ -1015,7 +1020,7 @@ class LeboncoinClient:
                 try:
                     await self._open_thread(target)
                 except Exception:
-                    pass
+                    logger.warning("Reouverture du fil apres echec d'envoi impossible", exc_info=True)
                 if _fil_contient_envoi(await self._lire_fil_courant(), texte):
                     logger.info(f"Conv {id_conv} : envoi retrouvé à la relecture du fil")
                     sent = True
@@ -1029,8 +1034,8 @@ class LeboncoinClient:
             try:
                 await self._goto(LBC_HOME)
                 self._current_thread_url = None
-            except Exception:
-                pass
+            except Exception as _err:
+                logger.debug("Retour a l'accueil apres envoi echoue : %s", type(_err).__name__)
             return sent
 
         except Exception as e:
@@ -1061,7 +1066,8 @@ class LeboncoinClient:
         for _ in range(30):  # ~15 s
             try:
                 data = await self.page.evaluate(JS_THREAD)
-            except Exception:
+            except Exception as _err:
+                logger.debug("Lecture du fil pendant la verification d'envoi echouee (nouvel essai) : %s", type(_err).__name__)
                 await asyncio.sleep(0.5)
                 continue
             # Texte COMPLET normalisé (typographie, insécables), pas un préfixe ;
