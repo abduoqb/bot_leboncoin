@@ -21,3 +21,5 @@ venv/
 .ruff_cache/
 *.pyc
 debugs/
+heartbeat.json
+heartbeat.json.tmp

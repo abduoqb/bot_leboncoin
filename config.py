@@ -27,7 +27,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 # ── LLM ──────────────────────────────────────────────────────────────────────
 # deepseek-v3.1:671b-cloud est un modèle CLOUD retiré → HTTP 410 Gone.
 # gemma3:4b est installé en local et gratuit (cf. README).
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 # Timeouts (s) par appel : un chargement à froid du modèle peut dépasser 60 s.
 OLLAMA_TIMEOUT_CLASSIFY = 30
@@ -92,6 +92,8 @@ IDLE_SCAN_LIMIT = 10      # Nombre de scans vides avant pause repos
 IDLE_REST_SECONDS = 3600  # Durée de la pause repos (1h)
 
 MAX_HISTORY = 8
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")   # DEBUG / INFO / WARNING / ERROR
+HEARTBEAT_FILE = os.path.join(BASE_DIR, "heartbeat.json")   # état écrit après chaque cycle
 HEADLESS = False       # False = navigateur visible
 DEBUG_SCREENSHOTS = True
 
