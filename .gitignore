@@ -12,3 +12,10 @@ cle_ssh.txt
 chrome_profile/
 bot.log
 *.log
+venv/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+debugs/
