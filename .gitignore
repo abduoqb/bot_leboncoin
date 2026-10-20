@@ -2,6 +2,8 @@
 session.json
 cookies.json
 conversations.db
+conversations.db-shm
+conversations.db-wal
 conversations.db.bak-*
 bot_state.json
 bot.lock
