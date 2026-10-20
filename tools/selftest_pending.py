@@ -8,7 +8,6 @@ Aucun navigateur, aucun réseau. Usage : python -u selftest_pending.py
 import json
 import logging
 import os
-import sqlite3
 import sys
 import tempfile
 

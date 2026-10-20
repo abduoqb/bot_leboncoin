@@ -1,6 +1,5 @@
 """Tests de main.process() avec de faux lbc/db (sans Ollama ni navigateur)."""
 import asyncio
-import os
 import subprocess
 import sys
 

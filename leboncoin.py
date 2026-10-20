@@ -742,7 +742,7 @@ class LeboncoinClient:
         # Pré-réponses proposées par leboncoin (facultatives) : on les trace.
         qr = thread.get("quickReplies") or []
         if qr:
-            logger.info(f"💡 Pré-réponse(s) leboncoin proposée(s) : "
+            logger.info("💡 Pré-réponse(s) leboncoin proposée(s) : "
                         + " | ".join(q[:60] for q in qr[:3]))
 
         # Offre reçue : message AUTOMATIQUE leboncoin → décision humaine.

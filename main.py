@@ -299,7 +299,7 @@ async def main():
     if not instance.acquerir():
         pid = instance.detenteur()
         logger.error(
-            f"❌ Un autre bot utilise déjà le profil Chrome"
+            "❌ Un autre bot utilise déjà le profil Chrome"
             + (f" (PID {pid})" if pid else "") + " → arrêt."
         )
         return

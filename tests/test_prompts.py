@@ -113,6 +113,10 @@ def test_donnees_non_codees_en_dur(mod):
     assert mod.PRODUIT["modele_annonce"] in mod.PROMPTS["produit"]
 
 
+@pytest.mark.skipif(
+    prompts.VENTE.get("ville") == exemple.VENTE.get("ville"),
+    reason="prompts.py est une copie de l'exemple (CI, clone neuf) : rien à comparer",
+)
 def test_prompts_prive_pas_de_valeurs_perimees():
     """Aucune valeur de VENTE/PRODUIT de l'exemple ne fuit dans le privé et
     inversement (pas de donnée personnelle dans l'exemple)."""

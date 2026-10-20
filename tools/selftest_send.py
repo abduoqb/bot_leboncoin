@@ -39,7 +39,7 @@ logging.basicConfig(
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 from leboncoin import (  # noqa: E402
-    LeboncoinClient, TEXTAREA, SEND_BTN, BUBBLE, JS_THREAD,
+    LeboncoinClient, TEXTAREA, SEND_BTN, JS_THREAD,
 )
 from config import BASE_DIR  # noqa: E402
 

@@ -1,6 +1,5 @@
 """Tests de config.valider_config() et du message d'erreur si prompts.py manque."""
 import copy
-import importlib
 import subprocess
 import sys
 import os

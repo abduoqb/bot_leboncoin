@@ -2,7 +2,7 @@
 
 Aucun import de config : les heures sont passées en paramètres.
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 
 def valider_heures(debut, fin):

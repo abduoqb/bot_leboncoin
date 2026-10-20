@@ -34,7 +34,7 @@ import logging
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
 from config import (  # noqa: E402
-    PROMPTS, BASE_PERSONA, REPONSES_STATIQUES, NOMS_A_NEUTRALISER, VENTE,
+    PROMPTS, REPONSES_STATIQUES, NOMS_A_NEUTRALISER, VENTE,
 )
 from conversation import ConversationManager  # noqa: E402
 from llm import classify_message, generate_reply, init_session, close_session  # noqa: E402
