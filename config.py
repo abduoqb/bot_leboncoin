@@ -1,6 +1,15 @@
 import os
 from dotenv import load_dotenv
-from prompts import PROMPT_ROUTER, BASE_PERSONA, PROMPTS, REPONSES_STATIQUES, VENTE
+
+try:
+    from prompts import PROMPT_ROUTER, BASE_PERSONA, PROMPTS, REPONSES_STATIQUES, VENTE
+except ModuleNotFoundError as _e:
+    if _e.name != "prompts":
+        raise
+    raise SystemExit(
+        "prompts.py est introuvable : copiez prompts.example.py vers prompts.py "
+        "(cp prompts.example.py prompts.py), puis renseignez le bloc VENTE."
+    ) from None
 
 # Noms de personnes à ne jamais voir apparaître dans une réponse (le nom du
 # compte vendeur, typiquement). Optionnel : prompts.example.py n'en définit pas.
@@ -78,8 +87,93 @@ CAPTCHA_MAX_PAR_HEURE = 4          # au-delà : pause longue (plus aucun scan)
 CAPTCHA_PAUSE_LONGUE_SECONDS = 5400  # durée de la pause longue (1 h 30)
 CAPTCHA_AUTO_MAX_PAR_HEURE = 2     # glissements AUTOMATIQUES max / fenêtre, puis attente humaine
 
+# Repos intelligent : après IDLE_SCAN_LIMIT scans vides d'affilée, pause longue.
+IDLE_SCAN_LIMIT = 10      # Nombre de scans vides avant pause repos
+IDLE_REST_SECONDS = 3600  # Durée de la pause repos (1h)
+
 MAX_HISTORY = 8
 HEADLESS = False       # False = navigateur visible
 DEBUG_SCREENSHOTS = True
 
 
+# ── VALIDATION ──────────────────────────────────────────────────────────────
+def _est_entier(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _est_nombre(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def valider_config():
+    """Vérifie la cohérence de la configuration (PAS appelée à l'import).
+
+    Lève ValueError avec la liste de TOUS les problèmes trouvés.
+    """
+    from horaire import valider_heures
+
+    g = globals()
+    problemes = []
+
+    # Cadence des scans
+    smin, smax = g["SCAN_MIN"], g["SCAN_MAX"]
+    for nom, v in (("SCAN_MIN", smin), ("SCAN_MAX", smax)):
+        if not _est_entier(v) or v <= 0:
+            problemes.append(f"{nom} doit être un entier > 0 (valeur : {v!r})")
+    if _est_entier(smin) and _est_entier(smax) and smin > smax:
+        problemes.append(f"SCAN_MIN ({smin}) doit être <= SCAN_MAX ({smax})")
+
+    n = g["MAX_CONVS_PER_SCAN"]
+    if not _est_entier(n) or n < 1:
+        problemes.append(f"MAX_CONVS_PER_SCAN doit être un entier >= 1 (valeur : {n!r})")
+
+    # Pause nocturne
+    try:
+        valider_heures(g["NIGHT_START_HOUR"], g["NIGHT_END_HOUR"])
+    except ValueError as e:
+        problemes.append(f"Pause nocturne : {e}")
+
+    # Bloc VENTE
+    vente = g["VENTE"]
+    if not isinstance(vente, dict):
+        problemes.append("VENTE doit être un dictionnaire")
+    else:
+        for cle in ("prix_affiche_eur", "prix_plancher_eur",
+                    "prix_contre_offre_eur", "disponibilite_confirmee", "ville"):
+            if cle not in vente:
+                problemes.append(f"VENTE: clé manquante « {cle} »")
+        prix = []
+        for cle in ("prix_plancher_eur", "prix_contre_offre_eur", "prix_affiche_eur"):
+            v = vente.get(cle)
+            if v is None:
+                continue          # None est autorisé (info inconnue)
+            if not _est_nombre(v) or v < 0:
+                problemes.append(f"VENTE['{cle}'] doit être un nombre >= 0 ou None (valeur : {v!r})")
+            else:
+                prix.append((cle, v))
+        valeurs = dict(prix)
+        if len(valeurs) == 3:
+            if not (valeurs["prix_plancher_eur"] <= valeurs["prix_contre_offre_eur"]
+                    <= valeurs["prix_affiche_eur"]):
+                problemes.append(
+                    "VENTE: il faut prix_plancher_eur <= prix_contre_offre_eur <= "
+                    f"prix_affiche_eur ({valeurs['prix_plancher_eur']} / "
+                    f"{valeurs['prix_contre_offre_eur']} / {valeurs['prix_affiche_eur']})")
+
+    # Constantes strictement positives (OLLAMA_*, CAPTCHA_*, repos)
+    positives = sorted(
+        k for k, v in g.items()
+        if (k.startswith(("OLLAMA_", "CAPTCHA_")) and _est_nombre(v)
+            and k not in ("OLLAMA_MODEL", "OLLAMA_URL", "OLLAMA_KEEP_ALIVE"))
+    ) + ["IDLE_SCAN_LIMIT", "IDLE_REST_SECONDS"]
+    for k in positives:
+        v = g[k]
+        if not _est_nombre(v) or v <= 0:
+            problemes.append(f"{k} doit être un nombre > 0 (valeur : {v!r})")
+    for k in ("OLLAMA_MODEL", "OLLAMA_URL"):
+        if not isinstance(g[k], str) or not g[k].strip():
+            problemes.append(f"{k} ne doit pas être vide")
+
+    if problemes:
+        raise ValueError(
+            "Configuration invalide :\n" + "\n".join(f"  - {p}" for p in problemes))

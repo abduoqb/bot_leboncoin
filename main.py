@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from config import (
     SCAN_MIN, SCAN_MAX, NIGHT_START_HOUR, NIGHT_END_HOUR, MAX_HISTORY,
     PROMPTS, REPONSES_STATIQUES, BASE_PERSONA, MAX_CONVS_PER_SCAN, BASE_DIR,
-    NOMS_A_NEUTRALISER, VENTE,
+    NOMS_A_NEUTRALISER, VENTE, IDLE_SCAN_LIMIT, IDLE_REST_SECONDS, valider_config,
 )
 
 from conversation import ConversationManager, fil_vers_historique
@@ -52,8 +52,6 @@ db = ConversationManager()
 lbc = LeboncoinClient()
 stats = {"messages_traites": 0, "erreurs": 0, "scans": 0}
 shutdown_event = asyncio.Event()
-IDLE_SCAN_LIMIT = 10      # Nombre de scans vides avant pause repos
-IDLE_REST_SECONDS = 3600  # Durée de la pause repos (1h)
 
 
 async def process() -> bool:
@@ -258,6 +256,13 @@ async def _scan_et_repondre() -> bool:
 
 
 async def main():
+    # Configuration cohérente avant toute ouverture de Chrome
+    try:
+        valider_config()
+    except ValueError as e:
+        logger.error(f"❌ {e}")
+        return 2
+
     # Heures de pause nocturne valides (0-23, entières) avant toute ouverture de Chrome
     valider_heures(NIGHT_START_HOUR, NIGHT_END_HOUR)
 
@@ -396,4 +401,4 @@ async def _attendre(secondes):
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()) or 0)

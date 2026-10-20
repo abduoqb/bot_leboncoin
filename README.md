@@ -85,7 +85,13 @@ Sinon, il laisse la liste tranquille. Et cette mémoire survit au redémarrage
   « Offre reçue : 400 € » attend ta décision, et le bot te le signale.
 - **Il se relance tout seul.** Si Chrome crashe ou est fermé, il redémarre le
   navigateur et reprend.
-- **Il dort la nuit.** De 1h à 6h, aucune activité.
+- **Il dort la nuit.** De 1h à 6h, aucune activité (réglable dans `config.py`).
+- **Il se protège.** Chaque réponse est validée avant l'envoi (plancher, URL,
+  téléphone, fragments d'instructions) et remplacée par une réponse sûre si elle
+  est rejetée. Après plusieurs captchas dans l'heure, il fait une longue pause
+  anti-captcha. En cas d'erreurs répétées, il ralentit (backoff).
+- **Il voit plus de 7 conversations.** Leboncoin n'en affiche que 7 environ : un
+  scan sur 2 à 4, le bot fait défiler la liste comme le ferait une personne.
 
 Le navigateur reste visible : tu peux le regarder travailler.
 
@@ -113,6 +119,9 @@ dépôt. Copie le modèle et remplis-le :
 ```bash
 cp prompts.example.py prompts.py
 ```
+
+Au démarrage, la configuration est vérifiée (`valider_config()`) et le bot
+refuse de partir avec une valeur incohérente, en listant tous les problèmes.
 
 Le minimum à renseigner est le bloc `VENTE` : ville, prix affiché, prix plancher,
 contre-offre. Tout est détaillé dans **Configuration**.
@@ -188,7 +197,7 @@ Deux façons de rester maître du jeu :
 | `OLLAMA_MODEL` | `gemma3:4b` | Le modèle local |
 | `OLLAMA_URL` | `http://localhost:11434/api/chat` | L'endpoint Ollama |
 | `SCAN_MIN` / `SCAN_MAX` | `75` / `180` | Secondes entre deux scans |
-| `NIGHT_START_HOUR` / `NIGHT_END_HOUR` | `1` / `6` | La pause nocturne |
+| `NIGHT_START_HOUR` / `NIGHT_END_HOUR` | `1` / `6` | La pause nocturne (heures 0-23, peut passer minuit) |
 | `MAX_CONVS_PER_SCAN` | `3` | Conversations traitées par scan |
 | `MAX_HISTORY` | `8` | Messages d'historique donnés au modèle |
 | `TYPING_SPEED_MIN` / `MAX` | `40` / `120` | Millisecondes entre les frappes |
@@ -196,10 +205,21 @@ Deux façons de rester maître du jeu :
 | `PROFILE_DIR` | `<racine>/chrome_profile` | Le profil Chrome persistant |
 | `CHROME_CHANNEL` | `chrome` | `chrome` = vrai Chrome, `None` = Chromium |
 | `CAPTCHA_WAIT_SECONDS` | `300` | Temps laissé à l'humain pour un captcha |
+| `CAPTCHA_MAX_PAR_HEURE` | `4` | Au-delà, pause longue (`CAPTCHA_PAUSE_LONGUE_SECONDS`, 1 h 30) |
+| `CAPTCHA_AUTO_MAX_PAR_HEURE` | `2` | Glissements automatiques max par heure (`CAPTCHA_FENETRE_SECONDS`) |
+| `LIST_SCROLL_EVERY_MIN` / `MAX` | `2` / `4` | Défilement de la liste un scan sur N |
+| `LIST_SCROLL_MAX_STEPS` / `STABLE` | `12` / `3` | Plafond de gestes, arrêt sans nouveauté |
+| `RESTART_COOLDOWN_SECONDS` | `180` | Délai minimal entre deux relances du navigateur |
+| `MAX_RESTART_ESSAIS` | `3` | Relances avant d'attendre le cooldown |
+| `OLLAMA_TIMEOUT_*`, `OLLAMA_MAX_ATTEMPTS_*`, `OLLAMA_BACKOFF_*` | voir `config.py` | Délais et reprises des appels au modèle |
+| `IDLE_SCAN_LIMIT` / `IDLE_REST_SECONDS` | `10` / `3600` | Repos après N scans vides, durée en secondes |
 | `DEBUG_SCREENSHOTS` | `True` | Capture PNG + HTML quand un fil ne charge pas |
 
-Le repos intelligent se règle en haut de `main.py` : après `IDLE_SCAN_LIMIT`
-scans vides (10), le bot se met en pause pendant `IDLE_REST_SECONDS` (1h).
+`OLLAMA_MODEL` et `OLLAMA_URL` peuvent aussi se surcharger sans toucher au code,
+dans un fichier `.env` (modèle : `.env.example`, sans aucun secret).
+
+Le repos intelligent : après `IDLE_SCAN_LIMIT` scans vides (10), le bot se met en
+pause pendant `IDLE_REST_SECONDS` (1h).
 
 ### Deux réglages à connaître
 
@@ -295,12 +315,21 @@ repérer un bot.
 Deux familles : ceux qui ne touchent pas au site (rapides, à lancer souvent) et
 ceux qui pilotent Chrome.
 
+**Tests unitaires** :
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
 **Sans navigateur**, c'est là qu'on itère :
 
 ```bash
 python -u tools/selftest_llm.py          # qualité des réponses (le plus utile)
 python -u tools/selftest_llm.py --case 5 # un seul cas
 python -u tools/selftest_scan.py         # règle anti-boucle de lecture
+python -u tools/selftest_pending.py      # réponses en attente après un envoi raté
+python -u tools/selftest_list_scroll.py  # défilement de la liste
 python -u tools/selftest_context.py      # priorité au fil de la page
 python -u tools/selftest_instance.py     # verrou « un seul bot »
 ```
@@ -317,8 +346,13 @@ ajuster `prompts.py`, relancer.
 python -u tools/dry_run.py                    # lit et génère, sans envoyer
 python -u tools/selftest_send.py              # diagnostic d'envoi, n'envoie rien
 python -u tools/selftest_send.py --confirm    # envoie réellement
-python -u tools/explore.py                    # re-cartographie le site
+python -u tools/explore.py --yes dump         # liste + 1re conversation (HTML/PNG/JSON)
+python -u tools/explore.py --yes threads      # anatomie des fils de discussion
+python -u tools/explore.py --yes sides        # côté entrant/sortant des bulles
 ```
+
+`--yes` (avant la sous-commande) évite la demande de confirmation. Le bot ne doit
+pas tourner en même temps : un seul programme à la fois sur le profil Chrome.
 
 Le dernier sert si Leboncoin change son HTML. Le bot s'appuie sur des attributs
 stables (`data-qa-id="message-bubble"`, `data-spark-component="textarea"`,
