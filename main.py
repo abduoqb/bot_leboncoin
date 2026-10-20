@@ -14,6 +14,7 @@ from config import (
 
 from conversation import ConversationManager, fil_vers_historique
 import instance
+from horaire import en_pause_nocturne, prochain_reveil, valider_heures
 from llm import generate_reply, classify_message, init_session, close_session
 from leboncoin import LeboncoinClient
 from rules import (
@@ -216,6 +217,9 @@ async def process() -> bool:
 
 
 async def main():
+    # Heures de pause nocturne valides (0-23, entières) avant toute ouverture de Chrome
+    valider_heures(NIGHT_START_HOUR, NIGHT_END_HOUR)
+
     # ── Un seul bot à la fois sur le profil Chrome ───────────────────────────
     # Un second programme sur ce profil ne peut pas ouvrir Chrome : il
     # ouvrirait des fenêtres « about:blank » et perturberait le bot en cours.
@@ -273,10 +277,8 @@ async def main():
     while not shutdown_event.is_set():
         # ── Check nocturne AVANT le scan (Bug 1) ──
         now = datetime.now()
-        if NIGHT_START_HOUR <= now.hour < NIGHT_END_HOUR:
-            reveil = now.replace(hour=NIGHT_END_HOUR, minute=0, second=0, microsecond=0)
-            if reveil < now:
-                reveil += timedelta(days=1)
+        if en_pause_nocturne(now, NIGHT_START_HOUR, NIGHT_END_HOUR):
+            reveil = prochain_reveil(now, NIGHT_END_HOUR)
             duree_sec = (reveil - now).total_seconds()
             logger.info(f"🌙 Pause nocturne activée. Le bot dort jusqu'à {NIGHT_END_HOUR}h00 ({int(duree_sec/60)} min restantes)...")
             try:
