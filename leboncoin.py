@@ -24,6 +24,7 @@ import sys
 import json
 import time
 import random
+import re
 import logging
 import asyncio
 
@@ -43,9 +44,19 @@ from config import (
     CAPTCHA_MAX_PAR_HEURE,
     CAPTCHA_PAUSE_LONGUE_SECONDS,
     CAPTCHA_AUTO_MAX_PAR_HEURE,
+    MAX_CONVS_PER_SCAN,
+    LIST_SCROLL_MAX_STEPS,
+    LIST_SCROLL_STABLE,
+    LIST_SCROLL_EVERY_MIN,
+    LIST_SCROLL_EVERY_MAX,
 )
 import human as H
-from captcha import CAPTCHA_JS_EXPR
+from state import _norm_texte, _fil_contient_envoi, id_conv_de  # noqa: F401
+from js import (  # noqa: F401  (ré-export : leboncoin.JS_LIST, etc.)
+    LBC_HOME, LBC_MESSAGES,
+    CONV_LINK, BUBBLE, TEXTAREA, SEND_BTN,
+    JS_STATE, JS_LIST, JS_LIST_BOX, JS_THREAD, JS_THREAD_READY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,47 +70,6 @@ _STATE_FILE = os.path.join(_BASE_DIR, "bot_state.json")
 # une conversation. Sans borne, un fil cassé serait rouvert à chaque scan.
 MAX_TENTATIVES = 3
 _STATE_VERSION = 2
-
-
-def _norm_texte(s) -> str:
-    """Normalise un texte pour comparer ce qu'on a envoyé à ce que la page affiche :
-    NFKC, espaces insécables/fines → espace, typographie (’ “ ” – …) aplanie,
-    espaces repliés, minuscules."""
-    import re
-    import unicodedata
-    s = unicodedata.normalize("NFKC", str(s or ""))
-    for a, b in (("’", "'"), ("‘", "'"), ("“", '"'), ("”", '"'),
-                 ("«", '"'), ("»", '"'), ("–", "-"), ("—", "-"),
-                 ("…", "...")):
-        s = s.replace(a, b)
-    return re.sub(r"\s+", " ", s).strip().lower()
-
-
-def _fil_contient_envoi(data, texte: str, seuil: float = 0.92) -> bool:
-    """La DERNIÈRE bulle du fil est-elle une bulle sortante portant déjà `texte` ?
-
-    Comparaison normalisée du texte complet (contenance, ou quasi-égalité pour
-    absorber de menus écarts de rendu).
-    """
-    if not data or not _norm_texte(texte):
-        return False
-    cible = _norm_texte(texte)
-    bulles = data.get("messages") or []
-    if bulles:
-        derniere = bulles[-1]
-        if derniere.get("side") != "out":
-            return False
-        vu = _norm_texte(derniere.get("text"))
-    else:
-        if data.get("lastSide") != "out":
-            return False
-        vu = _norm_texte(data.get("lastText"))
-    if not vu:
-        return False
-    if cible in vu:
-        return True
-    import difflib
-    return difflib.SequenceMatcher(None, cible, vu).ratio() >= seuil
 
 
 def _profil_occupe(erreur: BaseException) -> bool:
@@ -118,188 +88,7 @@ def _profil_occupe(erreur: BaseException) -> bool:
     )
 
 
-LBC_HOME = "https://www.leboncoin.fr/"
-LBC_MESSAGES = "https://www.leboncoin.fr/messages"
-
-CONV_LINK = 'a[href*="/messages/id/"]'
-BUBBLE = '[data-qa-id="message-bubble"]'
-TEXTAREA = '[data-spark-component="textarea"]'
-SEND_BTN = '[data-qa-id="message-send"]'
-
-# ── JS ───────────────────────────────────────────────────────────────────────
-
-# État de la page : captcha DataDome ? page de connexion ?
-# - `captcha` : motifs partagés avec captcha.is_captcha_present (CAPTCHA_JS_EXPR).
-# - `login`   : vrai SEULEMENT sur l'URL d'authentification (auth.leboncoin.fr,
-#   /login, /connexion) ou dans un VRAI formulaire de connexion (un <form> qui
-#   contient un champ mot de passe ET un identifiant e-mail/utilisateur). Un
-#   simple input[type=password] (modale de confirmation, etc.) ne suffit plus ;
-#   la page de connexion réelle reste détectée par son URL.
-JS_STATE = r"""() => {
-  const formConnexion = [...document.querySelectorAll('form')].some(f =>
-    f.querySelector('input[type="password"]')
-    && f.querySelector('input[type="email"], input[name*="mail" i], input[name*="user" i], input[autocomplete="username"]'));
-  return {
-    url: location.href,
-    captcha: __CAPTCHA_EXPR__,
-    login: /auth\.leboncoin\.fr|\/(login|connexion)(\/|\?|$)/.test(location.href)
-      || formConnexion,
-  };
-}""".replace("__CAPTCHA_EXPR__", CAPTCHA_JS_EXPR)
-
-# Liste des conversations + détection du non-lu + aperçu du dernier message
-JS_LIST = r"""() => {
-  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-  const badgeOf = a => {
-    let p = a;
-    for (let i = 0; i < 6 && p; i++) {
-      if (p.querySelectorAll('a[href*="/messages/id/"]').length > 1) break;
-      const b = p.querySelector('[data-spark-component="badge"]');
-      if (b) {
-        const aria = b.getAttribute('aria-label') || '';
-        const title = b.getAttribute('title') || '';
-        const txt = clean(b.innerText);
-        if (aria || title || txt) return (aria + ' ' + title + ' ' + txt).toLowerCase();
-      }
-      p = p.parentElement;
-    }
-    return '';
-  };
-  return {
-    url: location.href,
-    items: [...document.querySelectorAll('a[href*="/messages/id/"]')].map(a => {
-      const raw = clean(a.innerText);
-      return {
-        href: a.getAttribute('href'),
-        raw: raw.slice(0, 220),
-        preview: raw.replace(/\s*-\s*il y a .*$/i, '').trim(),
-        unread: /non lu|notification/.test(badgeOf(a)),
-      };
-    }),
-  };
-}"""
-
-# Zone de la liste (ancêtre scrollable du 1er lien, sinon le lien lui-même)
-JS_LIST_BOX = r"""() => {
-  const a = document.querySelector('a[href*="/messages/id/"]');
-  if (!a) return null;
-  let el = a.parentElement;
-  while (el && el !== document.body) {
-    const oy = getComputedStyle(el).overflowY;
-    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 4) break;
-    el = el.parentElement;
-  }
-  const r = (el && el !== document.body ? el : a).getBoundingClientRect();
-  return { x: r.x, y: r.y, w: r.width, h: r.height };
-}"""
-
-# Fil de discussion : bulles + côté (entrant / sortant) + messages automatiques
-JS_THREAD = r"""() => {
-  const clean = s => (s || '').replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
-
-  const visible = el => {
-    if (!el) return false;
-    const r = el.getBoundingClientRect();
-    // Seuil volontairement bas : une bulle courte fait ~20x37px
-    if (r.width < 20 || r.height < 8) return false;
-    const cs = getComputedStyle(el);
-    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
-  };
-
-  // Conteneur du fil = <ol> scrollable VISIBLE qui contient le plus de bulles.
-  // (le SPA laisse parfois l'ancien fil dans le DOM : on ne veut que le visible)
-  let container = null, best = -1;
-  for (const o of document.querySelectorAll('ol')) {
-    if (!visible(o) || !/auto|scroll/.test(getComputedStyle(o).overflowY)) continue;
-    const n = o.querySelectorAll('[data-qa-id="message-bubble"]').length;
-    if (n >= best) { best = n; container = o; }
-  }
-  const root = container || document;
-
-  const sideOf = b => {
-    const cls = b.className || '';
-    if (cls.includes('rounded-br-none')) return 'out';
-    if (cls.includes('rounded-bl-none')) return 'in';
-    const p = b.parentElement;
-    if (p) {
-      const j = getComputedStyle(p).justifyContent;
-      if (j === 'flex-end') return 'out';
-      if (j === 'flex-start') return 'in';
-    }
-    if (container) {
-      const br = b.getBoundingClientRect(), or = container.getBoundingClientRect();
-      return (br.left + br.width / 2) > (or.left + or.width / 2) ? 'out' : 'in';
-    }
-    return 'in';
-  };
-
-  const nodes = [...root.querySelectorAll('[data-qa-id="message-bubble"]')].filter(visible);
-  const all = nodes.map(b => ({ text: clean(b.innerText), side: sideOf(b) }));
-  const last = all.length ? all[all.length - 1] : null;
-
-  // Suite finale de messages de l'ACHETEUR (non répondus)
-  const trailingIn = [];
-  for (let i = all.length - 1; i >= 0; i--) {
-    if (all[i].side !== 'in') break;
-    trailingIn.unshift(all[i].text);
-  }
-
-  // Messages AUTOMATIQUES leboncoin = éléments du fil SANS bulle de message.
-  // On en distingue :
-  //   • l'en-tête « À propos de cet acheteur / ce vendeur » (donne NOTRE rôle) ;
-  //   • le bandeau « Envoyez une réponse rapide » (pré-réponses proposées) ;
-  //   • les vrais messages système (offre reçue, disponibilité…).
-  const sysTexts = [];
-  const quickReplies = [];
-  let counterpart = null;
-  if (container) {
-    for (const li of container.children) {
-      if (li.querySelector('[data-qa-id="message-bubble"]')) continue;
-      const t = clean(li.innerText);
-      if (!t) continue;
-      if (/^À propos de cet acheteur/i.test(t)) { counterpart = 'acheteur'; continue; }
-      if (/^À propos de ce vendeur/i.test(t)) { counterpart = 'vendeur'; continue; }
-      if (/Envoyez une réponse rapide/i.test(t)) {
-        const chips = [...li.querySelectorAll('[data-spark-component="chip"]')]
-          .map(c => clean(c.innerText)).filter(Boolean);
-        if (chips.length) quickReplies.push(...chips);
-        else {
-          const s = t.replace(/^Envoyez une réponse rapide\s*/i, '').trim();
-          if (s) quickReplies.push(s);
-        }
-        continue;
-      }
-      if (t.length < 400) sysTexts.push(t);
-    }
-  }
-
-  // Une offre se reconnaît UNIQUEMENT dans les messages automatiques du fil
-  // (jamais dans les bulles : notre propre réponse contient le mot « offre »,
-  // et la bannière cookies contient un bouton « Accepter »).
-  const sysJoined = sysTexts.join('\n');
-  const hasOffer = /Offre reçue|Vous avez\s+\d+\s*heures?\s+pour accepter|Accepter\s+\d+\s*€/i
-    .test(sysJoined);
-
-  return {
-    url: location.href,
-    count: all.length,
-    scrollHeight: container ? container.scrollHeight : 0,
-    lastSide: last ? last.side : null,
-    lastText: last ? last.text : null,
-    buyersText: (last && last.side === 'in' && trailingIn.length)
-      ? trailingIn.join('\n') : null,
-    // Le fil complet, dans l'ordre : c'est LUI qui fait foi pour le contexte
-    // (il contient les messages envoyés à la main, que la base ignore).
-    messages: all.slice(-40),
-    // La page n'affiche que les derniers messages : au-delà, la base complète.
-    hasMoreAbove: container
-      ? (container.scrollHeight > container.clientHeight + 40) : false,
-    hasOffer,
-    counterpart,
-    quickReplies: quickReplies.slice(0, 5),
-    systemTexts: sysTexts.slice(0, 5),
-  };
-}"""
+# Sélecteurs et scripts JS : définis dans js.py (ré-exportés ici, API inchangée).
 
 
 class LeboncoinClient:
@@ -745,8 +534,6 @@ class LeboncoinClient:
         au plafond de gestes, ou dès que `cible` (href) est apparue.
         Retourne le même format que JS_LIST (url + items).
         """
-        from config import LIST_SCROLL_MAX_STEPS, LIST_SCROLL_STABLE
-
         data = await self.page.evaluate(JS_LIST)
         trouves = {}
 
@@ -780,7 +567,6 @@ class LeboncoinClient:
 
     def _defilement_du_scan(self) -> bool:
         """Faut-il défiler la liste à ce scan ? (un scan sur N, N aléatoire)"""
-        from config import LIST_SCROLL_EVERY_MIN, LIST_SCROLL_EVERY_MAX
         if self._scans_avant_defilement > 0:
             self._scans_avant_defilement -= 1
             return False
@@ -802,7 +588,7 @@ class LeboncoinClient:
 
         href = conv_url
         if href.startswith("http"):
-            href = "/messages/id/" + href.rstrip("/").split("/")[-1]
+            href = "/messages/id/" + id_conv_de(href)
 
         loc = self.page.locator(f'a[href="{href}"]').first
         try:
@@ -820,17 +606,13 @@ class LeboncoinClient:
             logger.warning(f"⏹️ Clic sur la conversation impossible ({href}) — fil ignoré.")
             return False
 
-        id_conv = href.split("/")[-1]
+        id_conv = id_conv_de(href)
         try:
             # Le fil est prêt dès que l'URL correspond ET qu'il contient soit une
             # bulle de message, soit un message automatique leboncoin (offre,
             # rappel de disponibilité…) qui, lui, n'est PAS une bulle.
             await self.page.wait_for_function(
-                """(id) => location.pathname.includes(id) && (
-                    document.querySelector('[data-qa-id="message-bubble"]')
-                    || /Message automatique leboncoin|Offre reçue|s'intéresse à votre annonce/i
-                         .test(document.body.innerText)
-                )""",
+                JS_THREAD_READY,
                 arg=id_conv,
                 timeout=15000,
             )
@@ -863,7 +645,7 @@ class LeboncoinClient:
         todo = []
         for it in items:
             href = it["href"]
-            id_conv = href.rstrip("/").split("/")[-1]
+            id_conv = id_conv_de(href)
             preview = it["preview"]
 
             change = self._last_previews.get(href) != preview
@@ -904,21 +686,9 @@ class LeboncoinClient:
         self._save_state()
         return todo
 
-    async def get_new_messages(self) -> list:
-        """Renvoie les conversations dont le DERNIER message vient de l'acheteur."""
-        from config import MAX_CONVS_PER_SCAN
-        conversations = []
-        self._shutdown = False
-        self._scan_bloque = False
-
-        if self._en_pause_captcha():
-            reste = max(0, int(self._pause_captcha_jusqu - time.monotonic()))
-            logger.warning(f"⏸️ Pause anti-captcha : scan sauté (encore ~{reste // 60} min).")
-            return []
-
-        if not await self._ensure_on_messages():
-            return []
-
+    async def _lister_conversations(self) -> list:
+        """Lit la liste (avec défilement un scan sur N) et dédoublonne par href.
+        Renvoie [] si la liste est illisible ou vide."""
         try:
             if self._defilement_du_scan():
                 data = await self._load_all_conversations()
@@ -938,6 +708,100 @@ class LeboncoinClient:
 
         if not items:
             logger.info("✅ Aucune conversation dans la liste.")
+        return items
+
+    def _classer_fil(self, it: dict, id_conv: str, conv_url: str, thread):
+        """Après lecture d'un fil : met à jour la mémoire (aperçu, ignorées,
+        réglées, en attente) et renvoie la conversation à traiter, ou None."""
+        # Le fil a bien été ouvert : l'aperçu est désormais « vu ». S'il n'y
+        # a rien à répondre il ne sera plus rouvert ; s'il reste une réponse
+        # en attente, `_pending` s'en charge (retentatives bornées).
+        # ⚠️ Cet enregistrement ne doit PAS avoir lieu avant l'ouverture :
+        # un fil coupé par la limite de scan doit rester candidat au scan
+        # suivant, sinon le message qu'il contient est perdu.
+        self._set_preview(it["href"], it["preview"])
+
+        if thread is None:
+            # Fil illisible (captcha, lien absent…) : échec RÉEL, compté ;
+            # on retente au scan suivant, `_pending` borne les essais.
+            self._noter_echec(id_conv)
+            return None
+
+        # Conversation où NOUS sommes l'acheteur (« À propos de ce vendeur ») :
+        # le bot ne doit jamais répondre à la place du vendeur d'une AUTRE
+        # annonce — et ne doit plus jamais la rouvrir.
+        if thread.get("counterpart") == "vendeur":
+            logger.info(f"⏭️ Conv {id_conv} : nous sommes l'acheteur → ignorée pour de bon.")
+            self._ignorees.add(id_conv)
+            self._pending.pop(id_conv, None)
+            self._save_state()
+            return None
+
+        # Pré-réponses proposées par leboncoin (facultatives) : on les trace.
+        qr = thread.get("quickReplies") or []
+        if qr:
+            logger.info(f"💡 Pré-réponse(s) leboncoin proposée(s) : "
+                        + " | ".join(q[:60] for q in qr[:3]))
+
+        # Offre reçue : message AUTOMATIQUE leboncoin → décision humaine.
+        # On ne répond JAMAIS à la place de l'offre, mais un vrai message
+        # d'acheteur présent dans le même fil reste traité normalement.
+        if thread.get("hasOffer"):
+            offre = (thread.get("systemTexts") or [""])[0][:140]
+            logger.warning(
+                f"💰 OFFRE reçue dans {id_conv} (message automatique) — aucune "
+                f"réponse auto à l'offre, à traiter toi-même. « {offre} »"
+            )
+
+        if thread.get("lastSide") == "out":
+            logger.debug(f"⏭️ Dernier message = nous, conv réglée ({id_conv})")
+            self._settled.add(id_conv)
+            self._pending.pop(id_conv, None)
+            self._save_state()
+            return None
+
+        texte = thread.get("buyersText")
+        if not texte:
+            logger.debug(f"⏭️ Fil sans message d'acheteur ({id_conv})")
+            self._settled.add(id_conv)
+            self._pending.pop(id_conv, None)
+            self._save_state()
+            return None
+
+        # Réponse à produire : elle reste « en attente » jusqu'à ce que
+        # l'envoi soit confirmé (send_message la retire de _pending).
+        # Compteur à 0 = aucun échec ; send_message/_noter_echec l'incrémente.
+        self._pending.setdefault(id_conv, 0)
+        self._save_state()
+
+        conv = {
+            "id_conv": id_conv,
+            "conv_url": conv_url,
+            "texte": texte,
+            "unread": it["unread"],
+            "quick_replies": thread.get("quickReplies") or [],
+            "messages": thread.get("messages") or [],
+            "fil_tronque": bool(thread.get("hasMoreAbove")),
+        }
+        logger.info(f"💬 Conv {id_conv}: {texte[:80]}…")
+        return conv
+
+    async def get_new_messages(self) -> list:
+        """Renvoie les conversations dont le DERNIER message vient de l'acheteur."""
+        conversations = []
+        self._shutdown = False
+        self._scan_bloque = False
+
+        if self._en_pause_captcha():
+            reste = max(0, int(self._pause_captcha_jusqu - time.monotonic()))
+            logger.warning(f"⏸️ Pause anti-captcha : scan sauté (encore ~{reste // 60} min).")
+            return []
+
+        if not await self._ensure_on_messages():
+            return []
+
+        items = await self._lister_conversations()
+        if not items:
             return []
 
         nb_non_lues = sum(1 for it in items if it["unread"])
@@ -967,7 +831,7 @@ class LeboncoinClient:
             href = it["href"]
             conv_url = (href if href.startswith("http")
                         else f"https://www.leboncoin.fr{href}")
-            id_conv = conv_url.rstrip("/").split("/")[-1]
+            id_conv = id_conv_de(conv_url)
 
             inspected += 1
             self._captcha_fil = False
@@ -985,77 +849,9 @@ class LeboncoinClient:
                             f"fil relu au prochain scan (pas un échec).")
                 continue
 
-            # Le fil a bien été ouvert : l'aperçu est désormais « vu ». S'il n'y
-            # a rien à répondre il ne sera plus rouvert ; s'il reste une réponse
-            # en attente, `_pending` s'en charge (retentatives bornées).
-            # ⚠️ Cet enregistrement ne doit PAS avoir lieu avant l'ouverture :
-            # un fil coupé par la limite de scan doit rester candidat au scan
-            # suivant, sinon le message qu'il contient est perdu.
-            self._set_preview(href, it["preview"])
-
-            if thread is None:
-                # Fil illisible (captcha, lien absent…) : échec RÉEL, compté ;
-                # on retente au scan suivant, `_pending` borne les essais.
-                self._noter_echec(id_conv)
-                continue
-
-            # Conversation où NOUS sommes l'acheteur (« À propos de ce vendeur ») :
-            # le bot ne doit jamais répondre à la place du vendeur d'une AUTRE
-            # annonce — et ne doit plus jamais la rouvrir.
-            if thread.get("counterpart") == "vendeur":
-                logger.info(f"⏭️ Conv {id_conv} : nous sommes l'acheteur → ignorée pour de bon.")
-                self._ignorees.add(id_conv)
-                self._pending.pop(id_conv, None)
-                self._save_state()
-                continue
-
-            # Pré-réponses proposées par leboncoin (facultatives) : on les trace.
-            qr = thread.get("quickReplies") or []
-            if qr:
-                logger.info(f"💡 Pré-réponse(s) leboncoin proposée(s) : "
-                            + " | ".join(q[:60] for q in qr[:3]))
-
-            # Offre reçue : message AUTOMATIQUE leboncoin → décision humaine.
-            # On ne répond JAMAIS à la place de l'offre, mais un vrai message
-            # d'acheteur présent dans le même fil reste traité normalement.
-            if thread.get("hasOffer"):
-                offre = (thread.get("systemTexts") or [""])[0][:140]
-                logger.warning(
-                    f"💰 OFFRE reçue dans {id_conv} (message automatique) — aucune "
-                    f"réponse auto à l'offre, à traiter toi-même. « {offre} »"
-                )
-
-            if thread.get("lastSide") == "out":
-                logger.debug(f"⏭️ Dernier message = nous, conv réglée ({id_conv})")
-                self._settled.add(id_conv)
-                self._pending.pop(id_conv, None)
-                self._save_state()
-                continue
-
-            texte = thread.get("buyersText")
-            if not texte:
-                logger.debug(f"⏭️ Fil sans message d'acheteur ({id_conv})")
-                self._settled.add(id_conv)
-                self._pending.pop(id_conv, None)
-                self._save_state()
-                continue
-
-            # Réponse à produire : elle reste « en attente » jusqu'à ce que
-            # l'envoi soit confirmé (send_message la retire de _pending).
-            # Compteur à 0 = aucun échec ; send_message/_noter_echec l'incrémente.
-            self._pending.setdefault(id_conv, 0)
-            self._save_state()
-
-            conversations.append({
-                "id_conv": id_conv,
-                "conv_url": conv_url,
-                "texte": texte,
-                "unread": it["unread"],
-                "quick_replies": thread.get("quickReplies") or [],
-                "messages": thread.get("messages") or [],
-                "fil_tronque": bool(thread.get("hasMoreAbove")),
-            })
-            logger.info(f"💬 Conv {id_conv}: {texte[:80]}…")
+            conv = self._classer_fil(it, id_conv, conv_url, thread)
+            if conv:
+                conversations.append(conv)
 
         self._save_state()
         return conversations
@@ -1095,7 +891,7 @@ class LeboncoinClient:
         st = await self._state()
         if st.get("captcha"):
             if DEBUG_SCREENSHOTS:
-                await self.debug_dump_page(f"captcha_thread_{conv_url.split('/')[-1]}")
+                await self.debug_dump_page(f"captcha_thread_{id_conv_de(conv_url)}")
             self._captcha_fil = True
             # Échec/timeout propagé via self._scan_bloque (posé par _wait_human).
             await self._wait_human("Captcha détecté dans une conversation")
@@ -1280,8 +1076,7 @@ class LeboncoinClient:
     # ── Debug / arrêt ────────────────────────────────────────────────────────
 
     async def debug_dump_page(self, label: str = "debug"):
-        import re as _re
-        safe = _re.sub(r"[^a-z0-9_]", "_", label.lower())
+        safe = re.sub(r"[^a-z0-9_]", "_", label.lower())
         dbg = os.path.join(_BASE_DIR, "debugs")
         os.makedirs(dbg, exist_ok=True)
         try:
