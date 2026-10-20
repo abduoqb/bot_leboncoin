@@ -171,7 +171,7 @@ def is_disponibilite(text: str, max_words: int = 14) -> bool:
     return len(t.split()) <= max_words
 
 
-def reponse_disponibilite(dispo, ville: str | None = None) -> str:
+def reponse_disponibilite(dispo: bool | None, ville: str | None = None) -> str:
     """Réponse figée à une question de disponibilité (dispo = VENTE[...])."""
     if dispo is True:
         base = "Oui, elle est toujours disponible."
@@ -217,7 +217,7 @@ def _normalise(text: str) -> str:
     return _MILLIERS_RE.sub(lambda m: re.sub(r"\D", "", m.group(0)), t)
 
 
-def _extraire(text: str, mini, maxi) -> tuple:
+def _extraire(text: str, mini: float, maxi: float) -> tuple[str, list[tuple[float, int, int]]]:
     """(texte normalisé, [(valeur, début, fin)]) des montants dans [mini, maxi]."""
     norm = _normalise(text or "")
     out = []
@@ -254,7 +254,7 @@ _CUE_OFFRE_RE = re.compile(
 )
 
 
-def bornes_montant(vente: dict) -> tuple:
+def bornes_montant(vente: dict) -> tuple[int, int]:
     """Plage de montants plausibles pour CETTE vente (évite les faux positifs).
 
     Bornes larges autour des prix connus : en dessous, il s'agit presque
@@ -292,7 +292,7 @@ _LIEN_APRES_RE = re.compile(
 )
 
 
-def montant_offert(texte: str, mini, maxi):
+def montant_offert(texte: str, mini: float, maxi: float) -> float | None:
     """Le montant de l'OFFRE dans un message, ou None si on ne peut trancher.
 
     - un seul montant plausible → c'est lui ;
@@ -314,11 +314,11 @@ def montant_offert(texte: str, mini, maxi):
     return lies.pop() if len(lies) == 1 else None
 
 
-def _fmt(montant) -> str:
+def _fmt(montant: float) -> str:
     return f"{montant:g}"
 
 
-def offre_chiffree(texte: str, vente: dict):
+def offre_chiffree(texte: str, vente: dict) -> tuple[float, float | None] | None:
     """Décision sur une offre chiffrée : (montant proposé, montant à annoncer).
 
     Le second vaut :
@@ -391,14 +391,14 @@ def accepte_sous_le_plancher(reponse: str, texte_acheteur: str, vente: dict) -> 
     return bool(prix) and max(prix) < plancher
 
 
-def reponse_offre(offre, cible, vente: dict) -> str:
+def reponse_offre(offre: float, cible: float | None, vente: dict) -> str:
     """Réponse déterministe à une offre chiffrée."""
     if cible is not None and cible == offre:
         return f"Merci, à {_fmt(offre)} € ça me va."
     return reponse_contre_offre(vente)
 
 
-def corrige_offre(reponse: str, texte_acheteur: str, vente: dict):
+def corrige_offre(reponse: str, texte_acheteur: str, vente: dict) -> str | None:
     """Réponse corrigée si le modèle n'a pas respecté la décision chiffrée.
 
     Deux ratés observés en vrai, tous deux corrigés ici :
@@ -543,7 +543,8 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _TEL_LARGE_RE = re.compile(r"(?<!\d)\+\d[\d\s.\-]{7,}\d|(?<!\d)\d{10}(?!\d)")
 
 
-def valider_reponse(reponse, vente: dict, offre_acceptee=None) -> tuple:
+def valider_reponse(reponse: str | None, vente: dict,
+                    offre_acceptee: float | None = None) -> tuple[bool, str]:
     """(ok, raison) : la réponse peut-elle partir telle quelle chez l'acheteur ?
 
     Rejette : fuite du prix plancher (« 400 », « 400€ », « 400,00 »…) sauf si

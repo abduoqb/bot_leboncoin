@@ -1,0 +1,19 @@
+[project]
+name = "bot-lbc"
+version = "0.1.0"
+description = "Bot de reponse automatique Leboncoin (scripts a la racine, pas de packaging)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+# line-length non contrainte : pas de regle E501 selectionnee
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# config.py ré-exporte les symboles de prompts.py
+"config.py" = ["F401"]
+"leboncoin.py" = ["F401"]

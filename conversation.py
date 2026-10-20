@@ -5,12 +5,12 @@ import asyncio
 import os
 from datetime import datetime
 
+from config import BASE_DIR
+
 logger = logging.getLogger(__name__)
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
-def fil_vers_historique(bulles, retire_fin_acheteur: bool = True) -> list:
+def fil_vers_historique(bulles: list | None, retire_fin_acheteur: bool = True) -> list[dict]:
     """Convertit les bulles d'un fil (JS_THREAD) en historique de conversation.
 
     `side` vaut « in » (acheteur) ou « out » (nous). On retire la suite finale
@@ -38,9 +38,9 @@ def _meme_message(a: dict, b: dict) -> bool:
 class _SyncConversationManager:
     """Gestionnaire synchrone SQLite (ne pas utiliser directement)."""
 
-    def __init__(self, db_path=None):
+    def __init__(self, db_path: str | None = None) -> None:
         if db_path is None:
-            db_path = os.path.join(_BASE_DIR, "conversations.db")
+            db_path = os.path.join(BASE_DIR, "conversations.db")
         self.conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
         try:
             self.conn.execute("PRAGMA journal_mode=WAL")
@@ -49,7 +49,7 @@ class _SyncConversationManager:
             logger.warning(f"PRAGMA SQLite impossible : {e}")
         self._init_db()
 
-    def _init_db(self):
+    def _init_db(self) -> None:
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id_lbc    TEXT PRIMARY KEY,
@@ -62,7 +62,7 @@ class _SyncConversationManager:
         self.conn.commit()
 
     @staticmethod
-    def _parse_messages(raw) -> list:
+    def _parse_messages(raw: str | None) -> list:
         """JSON corrompu ou valeur non-liste → [] (jamais d'exception)."""
         try:
             val = json.loads(raw) if raw else []
@@ -71,7 +71,7 @@ class _SyncConversationManager:
             return []
         return val if isinstance(val, list) else []
 
-    def get_messages(self, id_lbc: str) -> tuple:
+    def get_messages(self, id_lbc: str) -> tuple[list, int]:
         """Lecture seule : aucune écriture (l'INSERT se fait dans les sauvegardes)."""
         try:
             row = self.conn.execute(
@@ -84,17 +84,7 @@ class _SyncConversationManager:
             logger.error(f"Erreur SQLite get_messages({id_lbc}): {e}")
             return [], 0
 
-    def get_nb_envois(self, id_lbc: str) -> int:
-        try:
-            row = self.conn.execute(
-                "SELECT nb_envois FROM conversations WHERE id_lbc=?", (id_lbc,)
-            ).fetchone()
-            return row[0] if row else 0
-        except sqlite3.Error as e:
-            logger.error(f"Erreur SQLite get_nb_envois({id_lbc}): {e}")
-            return 0
-
-    def save_message(self, id_lbc: str, role: str, content: str):
+    def save_message(self, id_lbc: str, role: str, content: str) -> None:
         self._ecrire(id_lbc, [(role, content)])
 
     def save_exchange(self, id_lbc: str, user: str, assistant: str) -> bool:
@@ -103,7 +93,7 @@ class _SyncConversationManager:
         Tout ou rien. Renvoie True si l'échange est enregistré."""
         return self._ecrire(id_lbc, [("user", user), ("assistant", assistant)])
 
-    def _ecrire(self, id_lbc: str, paires: list) -> bool:
+    def _ecrire(self, id_lbc: str, paires: list[tuple[str, str]]) -> bool:
         try:
             with self.conn:    # transaction : commit si OK, rollback sinon
                 self.conn.execute(
@@ -128,7 +118,7 @@ class _SyncConversationManager:
             return False
 
     def build_context(self, id_lbc: str, new_message: str, system_prompt: str,
-                      max_hist: int = 8, fil: list = None) -> tuple:
+                      max_hist: int = 8, fil: list | None = None) -> tuple[list, int]:
         """Construit le contexte envoyé au LLM.
 
         LE FIL LU DANS LA PAGE FAIT FOI (`fil`, issu de JS_THREAD) : il contient
@@ -167,7 +157,7 @@ class _SyncConversationManager:
         context.append({"role": "user", "content": new_message})
         return context, nb_envois
 
-    def close(self):
+    def close(self) -> None:
         try:
             self.conn.close()
             logger.info("Base SQLite fermée proprement")
@@ -178,28 +168,25 @@ class _SyncConversationManager:
 class ConversationManager:
     """Wrapper async pour ne pas bloquer l'event loop (Weakness 1)."""
 
-    def __init__(self, db_path=None):
+    def __init__(self, db_path: str | None = None) -> None:
         if db_path is None:
-            db_path = os.path.join(_BASE_DIR, "conversations.db")
+            db_path = os.path.join(BASE_DIR, "conversations.db")
         self._sync = _SyncConversationManager(db_path)
 
-    async def get_messages(self, id_lbc: str) -> tuple:
+    async def get_messages(self, id_lbc: str) -> tuple[list, int]:
         return await asyncio.to_thread(self._sync.get_messages, id_lbc)
 
-    async def get_nb_envois(self, id_lbc: str) -> int:
-        return await asyncio.to_thread(self._sync.get_nb_envois, id_lbc)
-
-    async def save_message(self, id_lbc: str, role: str, content: str):
+    async def save_message(self, id_lbc: str, role: str, content: str) -> None:
         await asyncio.to_thread(self._sync.save_message, id_lbc, role, content)
 
     async def save_exchange(self, id_lbc: str, user: str, assistant: str) -> bool:
         return await asyncio.to_thread(self._sync.save_exchange, id_lbc, user, assistant)
 
     async def build_context(self, id_lbc: str, new_message: str, system_prompt: str,
-                            max_hist: int = 8, fil: list = None) -> tuple:
+                            max_hist: int = 8, fil: list | None = None) -> tuple[list, int]:
         return await asyncio.to_thread(self._sync.build_context, id_lbc, new_message,
                                        system_prompt, max_hist, fil)
 
-    async def close(self):
+    async def close(self) -> None:
         await asyncio.to_thread(self._sync.close)
 

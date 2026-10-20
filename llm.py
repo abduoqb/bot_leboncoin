@@ -45,7 +45,7 @@ def _normaliser_categorie(brut: str) -> str:
 _session: aiohttp.ClientSession | None = None
 
 
-async def init_session():
+async def init_session() -> None:
     """Crée la session HTTP partagée (à appeler au démarrage)."""
     global _session
     if _session is None or _session.closed:
@@ -53,7 +53,7 @@ async def init_session():
         logger.debug("Session aiohttp créée")
 
 
-async def close_session():
+async def close_session() -> None:
     """Ferme la session HTTP proprement (à appeler au shutdown)."""
     global _session
     if _session and not _session.closed:
