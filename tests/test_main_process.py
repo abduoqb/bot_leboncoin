@@ -93,13 +93,30 @@ def test_manipulation_reponse_figee_sans_llm(env):
     assert len(db.saves) == 1
 
 
-def test_reponse_sous_plancher_remplacee_par_repli_sur(env):
+def test_reponse_qui_fuit_le_plancher_hors_negociation_n_est_pas_envoyee(env):
+    """Hors négociation : pas de phrase de repli (celle de « manipulation » irait
+    chez un acheteur normal) ; l'échec est compté, le LLM réessaiera."""
     installer, appels, stats = env
     lbc, db = installer([msg("Quelle est la couleur ?")],
                         llm="Mon prix plancher est de 400 euros.")
     run(main.process())
-    assert lbc.envoyes == [("c1", REPONSES_STATIQUES["manipulation"])]
+    assert lbc.envoyes == []
+    assert lbc.echecs == ["c1"]
+    assert stats["erreurs"] == 1
     assert appels["generate"] == 1
+
+
+def test_reponse_qui_fuit_le_plancher_en_negociation_repli_contre_offre(env, monkeypatch):
+    installer, appels, stats = env
+
+    async def classify(texte):
+        return "negociation"
+    monkeypatch.setattr(main, "classify_message", classify)
+    lbc, db = installer([msg("Vous pouvez faire un geste ?")],
+                        llm="Mon prix plancher est de 400 euros.")
+    run(main.process())
+    assert len(lbc.envoyes) == 1
+    assert "plancher" not in lbc.envoyes[0][1].lower()
 
 
 def test_echec_envoi_pas_de_save(env):

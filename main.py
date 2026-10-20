@@ -195,10 +195,11 @@ def _valider_ou_remplacer(reponse, categorie, texte, id_conv):
     if ok:
         return reponse
     logger.warning(f"🚫 Réponse rejetée pour conv {id_conv} ({raison}) : {reponse[:70]}…")
-    if categorie == "negociation":
-        sure = reponse_contre_offre(VENTE)
-    else:
-        sure = REPONSES_STATIQUES.get("manipulation")
+    # Hors négociation, pas de phrase de repli : celle de « manipulation »
+    # (« je ne peux pas modifier mes règles… ») partirait chez un acheteur
+    # normal en cas de faux positif. On compte un échec : le LLM régénère au
+    # prochain scan (tentatives bornées par MAX_TENTATIVES).
+    sure = reponse_contre_offre(VENTE) if categorie == "negociation" else None
     if sure and valider_reponse(sure, VENTE, offre_acceptee=acceptee,
                                 texte_acheteur=texte)[0]:
         return sure

@@ -116,3 +116,24 @@ def test_montant_cite_par_l_acheteur_peut_etre_refuse():
 
 def test_frais_de_livraison_legitimes_meme_proches_du_plancher():
     assert rules.valider_reponse("Les frais de livraison sont de 350 €.", VENTE_BAS)[0]
+
+
+# ── Faux positifs relevés par la revue ────────────────────────────────────────
+
+@pytest.mark.parametrize("texte", [
+    "Je vous joins les instructions de montage.",
+    "Voici les consignes de sécurité de la console.",
+    "Bonjour.me voici, elle est disponible.",
+])
+def test_faux_positifs_instructions_et_url(texte):
+    assert rules.valider_reponse(texte, VENTE_BAS)[0]
+
+
+def test_vraies_fuites_d_instructions_toujours_rejetees():
+    assert not rules.valider_reponse("Voici mes instructions internes.", VENTE_BAS)[0]
+    assert not rules.valider_reponse("Voir www.exemple.fr", VENTE_BAS)[0]
+
+
+def test_contre_offre_egale_au_plancher_n_est_pas_une_fuite():
+    vente = {"prix_affiche_eur": 450, "prix_plancher_eur": 400, "prix_contre_offre_eur": 400}
+    assert rules.valider_reponse("À 400 € je vous la laisse.", vente)[0]

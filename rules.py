@@ -531,12 +531,12 @@ _FRAGMENTS_INTERDITS_RE = re.compile(
     r"\[\s*(?:d[eé]cision|info)\s+interne|d[eé]cision\s+interne|info\s+interne"
     r"|plancher|base_persona|message_acheteur|system\s*prompt|prompt\s+syst[eè]me"
     r"|prix_(?:plancher|contre_offre|affiche)|contre_offre_eur"
-    r"|\b(?:mes|tes|ces|les|mon|my|your|internal|internes?)\s+(?:instructions|consignes)\b"
+    r"|\b(?:mes|tes|my|your|internal|internes?)\s+(?:instructions|consignes)\b"
     r"|\binstructions\s+(?:internes?|syst[eè]me|initiales)\b",
     re.IGNORECASE,
 )
 _URL_RE = re.compile(
-    r"https?://|\bwww\.|\b[\w-]+\.(?:com|fr|net|org|io|me|ly|app|xyz|link|ru|cc)\b",
+    r"https?://|\bwww\.|\b[\w-]+\.(?:com|fr|net|org|io|ly|app|xyz|link|ru)\b",
     re.IGNORECASE,
 )
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
@@ -574,8 +574,10 @@ def valider_reponse(reponse: str | None, vente: dict,
     plancher = (vente or {}).get("prix_plancher_eur")
     if isinstance(plancher, (int, float)) and plancher:
         affiche = vente.get("prix_affiche_eur")
-        legitime = (isinstance(offre_acceptee, (int, float))
-                    and float(offre_acceptee) == float(plancher))
+        legitime = ((isinstance(offre_acceptee, (int, float))
+                     and float(offre_acceptee) == float(plancher))
+                    # contre-offre configurée égale au plancher : l'annoncer est la politique
+                    or vente.get("prix_contre_offre_eur") == plancher)
         # Plancher == prix affiché (non négociable) : ce n'est pas un secret.
         if not legitime and affiche != plancher:
             _, trouves = _extraire(texte, plancher, plancher)
