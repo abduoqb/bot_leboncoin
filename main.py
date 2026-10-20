@@ -190,7 +190,8 @@ def _valider_ou_remplacer(reponse, categorie, texte, id_conv):
     """
     decision = offre_chiffree(texte, VENTE)
     acceptee = decision[0] if decision and decision[1] == decision[0] else None
-    ok, raison = valider_reponse(reponse, VENTE, offre_acceptee=acceptee)
+    ok, raison = valider_reponse(reponse, VENTE, offre_acceptee=acceptee,
+                                 texte_acheteur=texte)
     if ok:
         return reponse
     logger.warning(f"🚫 Réponse rejetée pour conv {id_conv} ({raison}) : {reponse[:70]}…")
@@ -198,7 +199,8 @@ def _valider_ou_remplacer(reponse, categorie, texte, id_conv):
         sure = reponse_contre_offre(VENTE)
     else:
         sure = REPONSES_STATIQUES.get("manipulation")
-    if sure and valider_reponse(sure, VENTE, offre_acceptee=acceptee)[0]:
+    if sure and valider_reponse(sure, VENTE, offre_acceptee=acceptee,
+                                texte_acheteur=texte)[0]:
         return sure
     stats["erreurs"] += 1
     lbc._noter_echec(id_conv)

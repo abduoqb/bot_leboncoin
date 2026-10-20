@@ -544,12 +544,16 @@ _TEL_LARGE_RE = re.compile(r"(?<!\d)\+\d[\d\s.\-]{7,}\d|(?<!\d)\d{10}(?!\d)")
 
 
 def valider_reponse(reponse: str | None, vente: dict,
-                    offre_acceptee: float | None = None) -> tuple[bool, str]:
+                    offre_acceptee: float | None = None,
+                    texte_acheteur: str | None = None) -> tuple[bool, str]:
     """(ok, raison) : la réponse peut-elle partir telle quelle chez l'acheteur ?
 
     Rejette : fuite du prix plancher (« 400 », « 400€ », « 400,00 »…) sauf si
     c'est le montant d'une acceptation légitime (offre_acceptee) ; fragments
-    d'instructions internes ; URL, e-mail, téléphone ; réponse trop longue.
+    d'instructions internes ; URL, e-mail, téléphone ; réponse trop longue ;
+    prix en euros SOUS le plancher (entre la moitié du plancher et le plancher :
+    un modèle peut en inventer un), sauf si l'acheteur a lui-même écrit ce
+    montant (on le reprend pour le refuser : « 300 € c'est trop bas »).
     Le prix affiché et les contre-offres au-dessus du plancher restent permis.
     """
     if not reponse or not str(reponse).strip():
@@ -577,4 +581,20 @@ def valider_reponse(reponse: str | None, vente: dict,
             _, trouves = _extraire(texte, plancher, plancher)
             if trouves:
                 return False, f"fuite possible du prix plancher ({_fmt(plancher)})"
+
+        # Un prix sous le plancher dans la réponse = vente à perte possible.
+        norm, sous = _extraire(texte, plancher * 0.5, plancher - 0.01)
+        if sous:
+            cites = {v for v, _, _ in _extraire(texte_acheteur or "", 0, 10**9)[1]}
+            frais = vente.get("frais_livraison_eur")      # montant légitime, pas un prix de vente
+            if isinstance(frais, (int, float)):
+                cites.add(frais)
+            for val, deb, fin in sous:
+                if val in cites:
+                    continue
+                if (isinstance(offre_acceptee, (int, float))
+                        and float(offre_acceptee) == float(val)):
+                    continue
+                if re.search(r"€|euros?|eur|balles?", norm[deb:fin], re.IGNORECASE):
+                    return False, f"prix sous le plancher dans la réponse ({_fmt(val)})"
     return True, ""

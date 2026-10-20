@@ -79,3 +79,40 @@ def test_longueur_et_vide():
     assert rules.valider_reponse("a" * 600, VENTE)[0]
     assert not rules.valider_reponse("  ", VENTE)[0]
     assert not rules.valider_reponse(None, VENTE)[0]
+
+
+# ── Prix sous le plancher (revue de code) ─────────────────────────────────────
+
+VENTE_BAS = {"prix_affiche_eur": 450, "prix_plancher_eur": 400,
+             "prix_contre_offre_eur": 430, "frais_livraison_eur": 350}
+
+
+@pytest.mark.parametrize("texte", [
+    "Je vous le laisse à 300 € alors.",
+    "Pas de souci, 250 euros ça marche.",
+    "Je peux faire 399 €.",
+])
+def test_prix_sous_le_plancher_rejete(texte):
+    ok, raison = rules.valider_reponse(texte, VENTE_BAS)
+    assert not ok and "sous le plancher" in raison
+
+
+@pytest.mark.parametrize("texte", [
+    "Je vous la laisse à 430 €.",              # contre-offre au-dessus du plancher
+    "Elle est à 450 €, négociable un peu.",    # prix affiché
+    "Livraison possible, 8 € de frais.",       # bien en dessous de la moitié du plancher
+    "256 Go de stockage, très bon état.",      # pas un prix (pas d'unité)
+])
+def test_prix_legitimes_acceptes(texte):
+    assert rules.valider_reponse(texte, VENTE_BAS)[0]
+
+
+def test_montant_cite_par_l_acheteur_peut_etre_refuse():
+    """« 300 € c'est trop bas » : on reprend le montant de l'acheteur pour le refuser."""
+    rep = "300 € c'est trop bas, je peux faire 430 €."
+    assert not rules.valider_reponse(rep, VENTE_BAS)[0]
+    assert rules.valider_reponse(rep, VENTE_BAS, texte_acheteur="Je vous propose 300 €")[0]
+
+
+def test_frais_de_livraison_legitimes_meme_proches_du_plancher():
+    assert rules.valider_reponse("Les frais de livraison sont de 350 €.", VENTE_BAS)[0]
