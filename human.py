@@ -232,6 +232,35 @@ async def human_scroll(page, direction: str = "down", amount: int = None):
     await asyncio.sleep(random.uniform(0.5, 1.5))
 
 
+async def human_list_scroll(page, box: dict, allow_up: bool = True) -> str:
+    """
+    Un geste de défilement sur une liste, d'une longueur variable.
+
+    La souris se place d'abord dans `box` (x, y, w, h : zone de la liste), car
+    la molette agit là où se trouve le curseur. Le plus souvent on descend, plus
+    ou moins loin ; parfois on remonte un peu, parfois on s'arrête « lire ».
+    Retourne la direction réellement prise : 'down' ou 'up'.
+    """
+    try:
+        await human_move(
+            page,
+            box["x"] + box["w"] * random.uniform(0.25, 0.75),
+            box["y"] + box["h"] * random.uniform(0.25, 0.75),
+        )
+    except Exception as e:
+        logger.debug(f"human_list_scroll : placement de la souris impossible ({e})")
+
+    if allow_up and random.random() < 0.2:
+        await human_scroll(page, "up", random.randint(60, 260))
+        return "up"
+
+    long_geste = random.random() < 0.15
+    await human_scroll(page, "down", random.randint(600, 1100) if long_geste else random.randint(180, 720))
+    if random.random() < 0.25:
+        await asyncio.sleep(random.uniform(1.0, 3.0))   # on lit ce qui vient d'apparaître
+    return "down"
+
+
 # ── Séquences composées ───────────────────────────────────────────────────────
 
 async def arrive_on_page(page):

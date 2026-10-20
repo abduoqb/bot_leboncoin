@@ -34,6 +34,14 @@ TYPING_SPEED_MIN = 40  # Ms minimum entre chaque frappe au clavier
 TYPING_SPEED_MAX = 120 # Ms maximum entre chaque frappe au clavier
 MAX_CONVS_PER_SCAN = 3 # Conversations inspectées/traitées max par scan (anti-bot)
 
+# Leboncoin n'affiche qu'environ 7 conversations tant qu'on n'a pas défilé la
+# liste. Le bot la fait donc défiler comme le ferait une personne : un scan sur
+# N (N tiré au hasard dans cette plage), par gestes de longueur variable.
+LIST_SCROLL_EVERY_MIN = 2     # Défilement de la liste au moins tous les N scans...
+LIST_SCROLL_EVERY_MAX = 4     # ...et au plus tous les N scans (tirage aléatoire)
+LIST_SCROLL_MAX_STEPS = 12    # Plafond de gestes de défilement par passage
+LIST_SCROLL_STABLE = 3        # On s'arrête après N descentes sans nouvelle conversation
+
 # ── NAVIGATEUR / ANTI-DÉTECTION ─────────────────────────────────────────────
 # "profile" = vrai Chrome avec profil persistant (RECOMMANDÉ)
 #             → empreinte navigateur authentique + session conservée entre

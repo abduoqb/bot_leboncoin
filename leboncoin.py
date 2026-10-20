@@ -126,6 +126,20 @@ JS_LIST = r"""() => {
   };
 }"""
 
+# Zone de la liste (ancêtre scrollable du 1er lien, sinon le lien lui-même)
+JS_LIST_BOX = r"""() => {
+  const a = document.querySelector('a[href*="/messages/id/"]');
+  if (!a) return null;
+  let el = a.parentElement;
+  while (el && el !== document.body) {
+    const oy = getComputedStyle(el).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 4) break;
+    el = el.parentElement;
+  }
+  const r = (el && el !== document.body ? el : a).getBoundingClientRect();
+  return { x: r.x, y: r.y, w: r.width, h: r.height };
+}"""
+
 # Fil de discussion : bulles + côté (entrant / sortant) + messages automatiques
 JS_THREAD = r"""() => {
   const clean = s => (s || '').replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
@@ -259,6 +273,7 @@ class LeboncoinClient:
         self._pending = {}         # id_conv -> tentatives restantes (envoi raté)
         self._ignorees = set()     # id_conv où NOUS sommes l'acheteur
         self._settled = set()      # id_conv inspectés, plus rien à répondre
+        self._scans_avant_defilement = 0   # 0 = la prochaine lecture défile la liste
         self._load_state()
 
     # ── État persistant ──────────────────────────────────────────────────────
@@ -540,6 +555,60 @@ class LeboncoinClient:
         st = await self._state()
         return not st.get("captcha") and not st.get("login")
 
+    async def _load_all_conversations(self, cible: str = None) -> dict:
+        """Lit la liste en la faisant défiler, comme le ferait une personne.
+
+        Leboncoin n'affiche qu'environ 7 conversations tant qu'on n'a pas
+        défilé. Les liens vus à chaque geste sont CUMULÉS par href : si la page
+        recycle ses éléments, ceux déjà passés ne sont pas perdus.
+
+        On s'arrête quand plusieurs descentes de suite n'amènent rien de neuf,
+        au plafond de gestes, ou dès que `cible` (href) est apparue.
+        Retourne le même format que JS_LIST (url + items).
+        """
+        from config import LIST_SCROLL_MAX_STEPS, LIST_SCROLL_STABLE
+
+        data = await self.page.evaluate(JS_LIST)
+        trouves = {}
+
+        def fusionner(items):
+            avant = len(trouves)
+            for it in items:
+                if it.get("href"):
+                    trouves.setdefault(it["href"], it)
+            return len(trouves) > avant
+
+        fusionner(data.get("items", []))
+        stables = 0
+        try:
+            for etape in range(LIST_SCROLL_MAX_STEPS):
+                if cible and cible in trouves:
+                    break
+                box = await self.page.evaluate(JS_LIST_BOX)
+                if not box:
+                    break
+                sens = await H.human_list_scroll(self.page, box, allow_up=etape > 0)
+                nouveau = fusionner((await self.page.evaluate(JS_LIST)).get("items", []))
+                if sens == "down":
+                    stables = 0 if nouveau else stables + 1
+                    if stables >= LIST_SCROLL_STABLE:
+                        break
+        except Exception as e:
+            logger.debug(f"Défilement de la liste interrompu : {e}")
+
+        logger.debug(f"📜 Liste défilée : {len(trouves)} conversation(s) vues")
+        return {"url": data.get("url"), "items": list(trouves.values())}
+
+    def _defilement_du_scan(self) -> bool:
+        """Faut-il défiler la liste à ce scan ? (un scan sur N, N aléatoire)"""
+        from config import LIST_SCROLL_EVERY_MIN, LIST_SCROLL_EVERY_MAX
+        if self._scans_avant_defilement > 0:
+            self._scans_avant_defilement -= 1
+            return False
+        self._scans_avant_defilement = random.randint(
+            LIST_SCROLL_EVERY_MIN, LIST_SCROLL_EVERY_MAX) - 1
+        return True
+
     async def _open_thread(self, conv_url: str) -> bool:
         """Ouvre un fil en CLIQUANT le lien depuis la liste (jamais de deep-link)."""
         if (
@@ -558,6 +627,10 @@ class LeboncoinClient:
 
         loc = self.page.locator(f'a[href="{href}"]').first
         try:
+            # La liste vient d'être rechargée : le lien peut être au-delà des
+            # premières conversations affichées → on défile jusqu'à le voir.
+            if await loc.count() == 0:
+                await self._load_all_conversations(cible=href)
             await loc.scroll_into_view_if_needed(timeout=8000)
             await H.pause(0.3, 0.9)
         except Exception as e:
@@ -660,7 +733,10 @@ class LeboncoinClient:
             return []
 
         try:
-            data = await self.page.evaluate(JS_LIST)
+            if self._defilement_du_scan():
+                data = await self._load_all_conversations()
+            else:
+                data = await self.page.evaluate(JS_LIST)
         except Exception as e:
             logger.error(f"Lecture de la liste impossible : {e}")
             return []
