@@ -35,6 +35,15 @@ _CLOSING_WORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Signaux de refus / négociation : « merci mais trop cher » n'est PAS une
+# conclusion. Tout chiffre exclut aussi la clôture (« merci je vous donne 300 »).
+_CLOSING_NEGO_RE = re.compile(
+    r"\b(trop|mais|non|prix|cher|baisse[rz]?|offre|propose\w*|proposition|"
+    r"dernier|rabais|remise|r[eé]duc\w*|budget|euros?|eur|balles?|monter|"
+    r"descendre|moins)\b|€",
+    re.IGNORECASE,
+)
+
 # Réponse figée pour une conclusion (aucun appel LLM)
 REPONSE_CLOSING = "Bonne journée à vous également."
 
@@ -54,6 +63,8 @@ def is_closing(text: str, max_rest: int = 4) -> bool:
     t = text.strip()
     if "?" in t:
         return False
+    if re.search(r"\d", t) or _CLOSING_NEGO_RE.search(t):
+        return False                   # montant ou refus/négociation : au LLM
     if not _CLOSING_WORDS.search(t):
         return False
     rest = _CLOSING_WORDS.sub(" ", t)
@@ -93,9 +104,19 @@ def is_manipulation(text: str) -> bool:
 # pire des réponses : on ne la délègue pas au modèle.
 
 # Marqueurs de disponibilité de l'ARTICLE.
+# « dispo » SEUL est ambigu (« quand serez-vous dispo ? ») : il exige un
+# qualificatif (toujours, encore…) ou « est ». « disponible / en vente / à
+# vendre » restent acceptés seuls.
 _DISPO_RE = re.compile(
-    r"\b(toujours|encore|de\s+nouveau|d[eé]j[aà]|tjrs|toujours\s+pas)?\s*"
-    r"(disponible|dispo|en\s+vente|[aà]\s+vendre)\b",
+    r"\b(?:(?:toujours|encore|de\s+nouveau|d[eé]j[aà]|tjrs|est(?:-ce)?)\s+"
+    r"(?:(?:toujours|encore)\s+)?dispo"
+    r"|disponible|en\s+vente|[aà]\s+vendre)\b",
+    re.IGNORECASE,
+)
+
+# Disponibilité d'une PERSONNE (« quand serez-vous dispo ? »), pas de l'article.
+_DISPO_PERSONNE_RE = re.compile(
+    r"\b(?:quand|serez|seriez|[eê]tes|seras)\b[^.!?]{0,30}\b(?:dispo|disponible)\b",
     re.IGNORECASE,
 )
 
@@ -132,6 +153,8 @@ def is_disponibilite(text: str, max_words: int = 14) -> bool:
         return False
     if _DISPO_ACHETEUR_RE.search(t) and not _VENDU_RE.search(t):
         return False
+    if _DISPO_PERSONNE_RE.search(t) and not _VENDU_RE.search(t):
+        return False
     return len(t.split()) <= max_words
 
 
@@ -155,11 +178,41 @@ def reponse_disponibilite(dispo, ville: str | None = None) -> str:
 
 # Un montant : 2 à 4 chiffres, éventuellement suivi d'une devise. On exclut
 # ce qui est collé à une unité de temps (« 18h », « 20h30 », « 3 ans »).
+#
+# Le texte est d'abord NORMALISÉ (_normalise) : téléphones, dates et heures
+# sont neutralisés, et les séparateurs de milliers retirés
+# (« 1 200 € », « 1.200 », « 1,200 » → 1200). Les centimes sont conservés :
+# « 349,50 » → 349.5 (float), les montants entiers restent des int.
 _MONTANT_RE = re.compile(
-    r"(?<!\d)(\d{2,4})(?!\d)\s*(?:€|euros?|eur|balles?)?"
+    r"(?<!\d)(\d{2,4})(?:[.,](\d{1,2}))?(?!\d)\s*(?:€|euros?|eur|balles?)?"
     r"(?!\s*(?:h|h\d|min|mn|ans?|mois|jours?|semaines?|fois|km|go|to))",
     re.IGNORECASE,
 )
+
+_TEL_RE = re.compile(r"(?<!\d)(?:\+33|0033|0)\s?[1-9](?:[\s.\-]?\d{2}){4}(?!\d)")
+_DATE_RE = re.compile(r"(?<!\d)\d{1,2}\s*[/\-]\s*\d{1,2}(?:\s*[/\-]\s*\d{2,4})?(?!\d)"
+                      r"|(?<!\d)\d{1,2}\.\d{1,2}\.\d{2,4}(?!\d)")
+_HEURE_RE = re.compile(r"(?<!\d)\d{1,2}\s*[hH]\s*(?:\d{2})?(?!\d)")
+_MILLIERS_RE = re.compile(r"(?<!\d)(\d{1,3})(?:[   .,](\d{3}))+(?!\d)")
+
+
+def _normalise(text: str) -> str:
+    """Neutralise ce qui ressemble à un montant sans en être un."""
+    t = _TEL_RE.sub(" ", text)
+    t = _DATE_RE.sub(" ", t)
+    t = _HEURE_RE.sub(" ", t)
+    return _MILLIERS_RE.sub(lambda m: re.sub(r"\D", "", m.group(0)), t)
+
+
+def _extraire(text: str, mini, maxi) -> tuple:
+    """(texte normalisé, [(valeur, début, fin)]) des montants dans [mini, maxi]."""
+    norm = _normalise(text or "")
+    out = []
+    for m in _MONTANT_RE.finditer(norm):
+        val = float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else int(m.group(1))
+        if mini <= val <= maxi:
+            out.append((val, m.start(1), m.end()))
+    return norm, out
 
 # « Oui » du vendeur (à distinguer d'une contre-offre, qui cite un montant).
 _ACCEPTATION_RE = re.compile(
@@ -181,6 +234,7 @@ _CUE_OFFRE_RE = re.compile(
     r"je\s+viens|je\s+la\s+prends|"
     r"on\s+fait|on\s+dit|vous\s+me\s+la|"
     r"d'?accord\s+pour|"
+    r"\d\s*(?:€|euros?)?\s*,?\s*(?:[çc]a|cela)\s+(?:vous\s+)?(?:va|passe|marche|convient)|"
     r"billets?|cash|esp[èe]ces|"
     r"\b(?:à|a|pour)\s+\d{2,4}\s*(?:€|euros?))",
     re.IGNORECASE,
@@ -205,8 +259,46 @@ def montants(text: str, mini: int, maxi: int) -> list:
     """Montants plausibles (dans [mini, maxi]) trouvés dans un texte."""
     if not text:
         return []
-    return [int(m.group(1)) for m in _MONTANT_RE.finditer(text)
-            if mini <= int(m.group(1)) <= maxi]
+    return [v for v, _, _ in _extraire(text, mini, maxi)[1]]
+
+
+# Un montant est « lié » à l'offre s'il suit un verbe d'offre (« je vous
+# propose 350 », « je vous en donne 350 », « je peux monter à 370 ») ou s'il
+# est suivi de « ça vous va ? ». Un verbe passé (« je vous ai proposé »), lui,
+# ne compte pas : la dernière offre fait foi.
+_LIEN_AVANT_RE = re.compile(
+    r"(?<!\bai\s)(?<!\bavez\s)(?<!\bavons\s)"
+    r"\b(?:propose|donne|offre|mets?|paie|paye|monter|mettre|aller|prends|"
+    r"budget\s+(?:de|est))\s*(?:de|à|a|:|jusqu'?à|environ|autour\s+de)?\s*$",
+    re.IGNORECASE,
+)
+_LIEN_APRES_RE = re.compile(
+    r"^\s*(?:€|euros?|eur)?\s*,?\s*(?:[çc]a|cela)\s+(?:vous\s+)?"
+    r"(?:va|passe|marche|convient|irait)\b",
+    re.IGNORECASE,
+)
+
+
+def montant_offert(texte: str, mini, maxi):
+    """Le montant de l'OFFRE dans un message, ou None si on ne peut trancher.
+
+    - un seul montant plausible → c'est lui ;
+    - plusieurs → celui lié au verbe d'offre, s'il est unique ;
+    - sinon (plusieurs montants sans indice clair, ou plusieurs liés) → None,
+      et la décision revient au LLM.
+    """
+    norm, trouves = _extraire(texte, mini, maxi)
+    if not trouves:
+        return None
+    if len({v for v, _, _ in trouves}) == 1:
+        return trouves[0][0]
+    lies = set()
+    for val, deb, fin in trouves:
+        # on ne remonte pas au-delà de la phrase / de la virgule précédente
+        avant = re.split(r"[.!?;,\n]", norm[max(0, deb - 40):deb])[-1]
+        if _LIEN_AVANT_RE.search(avant) or _LIEN_APRES_RE.search(norm[fin:fin + 30]):
+            lies.add(val)
+    return lies.pop() if len(lies) == 1 else None
 
 
 def _fmt(montant) -> str:
@@ -229,10 +321,9 @@ def offre_chiffree(texte: str, vente: dict):
     if not _CUE_OFFRE_RE.search(texte or ""):
         return None
     mini, maxi = bornes_montant(vente)
-    offres = montants(texte, mini, maxi)
-    if not offres:
-        return None
-    offre = max(offres)
+    offre = montant_offert(texte, mini, maxi)
+    if offre is None:
+        return None            # aucun montant, ou ambigu : le LLM tranche
     if offre >= plancher:
         return offre, offre
     contre = vente.get("prix_contre_offre_eur")
@@ -343,8 +434,7 @@ _GREETING_RE = re.compile(
 
 # Civilité suivie d'un nom : « Monsieur Co » → « Monsieur ».
 _CIVILITE_NAME_RE = re.compile(
-    r"\b(monsieur|madame|mademoiselle|mme|mlle|mr)\s+[A-ZÀ-ÖØ-Þ][\w'’\-]*",
-    re.IGNORECASE,
+    r"\b((?i:monsieur|madame|mademoiselle|mme|mlle|mr))\s+[A-ZÀ-ÖØ-Þ][\w'’\-]*",
 )
 
 # Civilité seule, en tête, après retrait de la salutation.
