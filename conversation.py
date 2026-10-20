@@ -41,7 +41,12 @@ class _SyncConversationManager:
     def __init__(self, db_path=None):
         if db_path is None:
             db_path = os.path.join(_BASE_DIR, "conversations.db")
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=10000")
+        except sqlite3.Error as e:
+            logger.warning(f"PRAGMA SQLite impossible : {e}")
         self._init_db()
 
     def _init_db(self):
@@ -56,18 +61,25 @@ class _SyncConversationManager:
         """)
         self.conn.commit()
 
+    @staticmethod
+    def _parse_messages(raw) -> list:
+        """JSON corrompu ou valeur non-liste → [] (jamais d'exception)."""
+        try:
+            val = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("Historique JSON corrompu → ignoré")
+            return []
+        return val if isinstance(val, list) else []
+
     def get_messages(self, id_lbc: str) -> tuple:
+        """Lecture seule : aucune écriture (l'INSERT se fait dans les sauvegardes)."""
         try:
             row = self.conn.execute(
                 "SELECT messages, nb_envois FROM conversations WHERE id_lbc=?", (id_lbc,)
             ).fetchone()
             if not row:
-                self.conn.execute(
-                    "INSERT INTO conversations (id_lbc) VALUES (?)", (id_lbc,)
-                )
-                self.conn.commit()
                 return [], 0
-            return json.loads(row[0]), row[1]
+            return self._parse_messages(row[0]), (row[1] or 0)
         except sqlite3.Error as e:
             logger.error(f"Erreur SQLite get_messages({id_lbc}): {e}")
             return [], 0
@@ -83,18 +95,37 @@ class _SyncConversationManager:
             return 0
 
     def save_message(self, id_lbc: str, role: str, content: str):
+        self._ecrire(id_lbc, [(role, content)])
+
+    def save_exchange(self, id_lbc: str, user: str, assistant: str) -> bool:
+        """Écrit le message acheteur ET notre réponse dans UNE transaction.
+
+        Tout ou rien. Renvoie True si l'échange est enregistré."""
+        return self._ecrire(id_lbc, [("user", user), ("assistant", assistant)])
+
+    def _ecrire(self, id_lbc: str, paires: list) -> bool:
         try:
-            messages, nb = self.get_messages(id_lbc)
-            messages.append({"role": role, "content": content})
-            increment = 1 if role == "assistant" else 0
-            self.conn.execute(
-                "UPDATE conversations SET messages=?, nb_envois=?, updated=? WHERE id_lbc=?",
-                (json.dumps(messages, ensure_ascii=False), nb + increment, datetime.now(), id_lbc)
-            )
-            self.conn.commit()
-            logger.debug(f"Message sauvegardé ({role}) pour conv {id_lbc}")
+            with self.conn:    # transaction : commit si OK, rollback sinon
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO conversations (id_lbc) VALUES (?)", (id_lbc,))
+                row = self.conn.execute(
+                    "SELECT messages, nb_envois FROM conversations WHERE id_lbc=?",
+                    (id_lbc,)).fetchone()
+                messages = self._parse_messages(row[0]) if row else []
+                nb = (row[1] or 0) if row else 0
+                for role, content in paires:
+                    messages.append({"role": role, "content": content})
+                    if role == "assistant":
+                        nb += 1
+                self.conn.execute(
+                    "UPDATE conversations SET messages=?, nb_envois=?, updated=? WHERE id_lbc=?",
+                    (json.dumps(messages, ensure_ascii=False), nb,
+                     datetime.now().isoformat(), id_lbc))
+            logger.debug(f"{len(paires)} message(s) sauvegardé(s) pour conv {id_lbc}")
+            return True
         except sqlite3.Error as e:
-            logger.error(f"Erreur SQLite save_message({id_lbc}): {e}")
+            logger.error(f"Erreur SQLite écriture({id_lbc}): {e}")
+            return False
 
     def build_context(self, id_lbc: str, new_message: str, system_prompt: str,
                       max_hist: int = 8, fil: list = None) -> tuple:
@@ -160,6 +191,9 @@ class ConversationManager:
 
     async def save_message(self, id_lbc: str, role: str, content: str):
         await asyncio.to_thread(self._sync.save_message, id_lbc, role, content)
+
+    async def save_exchange(self, id_lbc: str, user: str, assistant: str) -> bool:
+        return await asyncio.to_thread(self._sync.save_exchange, id_lbc, user, assistant)
 
     async def build_context(self, id_lbc: str, new_message: str, system_prompt: str,
                             max_hist: int = 8, fil: list = None) -> tuple:

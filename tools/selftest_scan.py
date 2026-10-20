@@ -157,6 +157,7 @@ def main():
     for _ in range(10):
         if ids(lbc4._candidats(liste(1))) == ["conv0"]:
             tentatives += 1
+            lbc4._noter_echec("conv0")   # l'envoi/la lecture échoue vraiment
     verifie(f"envoi raté : {L.MAX_TENTATIVES} tentatives puis abandon",
             L.MAX_TENTATIVES, tentatives)
     verifie("…et le fil n'est plus jamais rouvert",

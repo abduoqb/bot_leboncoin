@@ -53,6 +53,48 @@ _STATE_FILE = os.path.join(_BASE_DIR, "bot_state.json")
 # Nombre de tentatives (envoi raté / fil qui ne s'ouvre pas) avant d'abandonner
 # une conversation. Sans borne, un fil cassé serait rouvert à chaque scan.
 MAX_TENTATIVES = 3
+_STATE_VERSION = 2
+
+
+def _norm_texte(s) -> str:
+    """Normalise un texte pour comparer ce qu'on a envoyé à ce que la page affiche :
+    NFKC, espaces insécables/fines → espace, typographie (’ “ ” – …) aplanie,
+    espaces repliés, minuscules."""
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(s or ""))
+    for a, b in (("’", "'"), ("‘", "'"), ("“", '"'), ("”", '"'),
+                 ("«", '"'), ("»", '"'), ("–", "-"), ("—", "-"),
+                 ("…", "...")):
+        s = s.replace(a, b)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _fil_contient_envoi(data, texte: str, seuil: float = 0.92) -> bool:
+    """La DERNIÈRE bulle du fil est-elle une bulle sortante portant déjà `texte` ?
+
+    Comparaison normalisée du texte complet (contenance, ou quasi-égalité pour
+    absorber de menus écarts de rendu).
+    """
+    if not data or not _norm_texte(texte):
+        return False
+    cible = _norm_texte(texte)
+    bulles = data.get("messages") or []
+    if bulles:
+        derniere = bulles[-1]
+        if derniere.get("side") != "out":
+            return False
+        vu = _norm_texte(derniere.get("text"))
+    else:
+        if data.get("lastSide") != "out":
+            return False
+        vu = _norm_texte(data.get("lastText"))
+    if not vu:
+        return False
+    if cible in vu:
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, cible, vu).ratio() >= seuil
 
 
 def _profil_occupe(erreur: BaseException) -> bool:
@@ -279,32 +321,82 @@ class LeboncoinClient:
     # ── État persistant ──────────────────────────────────────────────────────
 
     def _load_state(self):
-        """Recharge les aperçus déjà vus (survit aux redémarrages)."""
+        """Recharge la mémoire (survit aux redémarrages).
+
+        Format v2 : {"version": 2, "previews", "pending", "ignorees", "settled"}.
+        Ancien format (sans version) : {"previews"} seul → toujours lisible.
+        """
         try:
             with open(_STATE_FILE, encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("racine non-objet")
             previews = data.get("previews") or {}
             if isinstance(previews, dict):
                 self._last_previews = {str(k): str(v) for k, v in previews.items()}
-                logger.info(f"💾 Mémoire : {len(self._last_previews)} aperçu(s) déjà vu(s)")
+            pending = data.get("pending") or {}
+            if isinstance(pending, dict):
+                for k, v in pending.items():
+                    try:
+                        self._pending[str(k)] = max(0, int(v))
+                    except (TypeError, ValueError):
+                        self._pending[str(k)] = 0
+            for cle, cible in (("ignorees", self._ignorees), ("settled", self._settled)):
+                val = data.get(cle) or []
+                if isinstance(val, list):
+                    cible.update(str(x) for x in val)
+            logger.info(f"💾 Mémoire : {len(self._last_previews)} aperçu(s), "
+                        f"{len(self._pending)} en attente, {len(self._ignorees)} ignorée(s), "
+                        f"{len(self._settled)} réglée(s)")
         except FileNotFoundError:
             pass
         except Exception as e:
             logger.warning(f"Mémoire illisible ({e}) → on repart de zéro.")
 
     def _save_state(self):
+        """Écriture atomique : fichier .tmp puis os.replace (jamais de JSON tronqué)."""
+        tmp = _STATE_FILE + ".tmp"
         try:
-            with open(_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"previews": self._last_previews}, f,
-                          ensure_ascii=False, indent=0)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "version": _STATE_VERSION,
+                    "previews": self._last_previews,
+                    "pending": self._pending,
+                    "ignorees": sorted(self._ignorees),
+                    "settled": sorted(self._settled),
+                }, f, ensure_ascii=False, indent=0)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, _STATE_FILE)
         except Exception as e:
-            logger.debug(f"Sauvegarde de la mémoire impossible : {e}")
+            logger.warning(f"Sauvegarde de la mémoire impossible : {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
-    def _trim_state(self, garde: int = 400):
-        """Borne la taille de la mémoire (dict ordonné → on oublie les anciens)."""
+    def _set_preview(self, href: str, preview: str):
+        """Enregistre un aperçu en ordre LRU (pop puis réinsertion en fin)."""
+        self._last_previews.pop(href, None)
+        self._last_previews[href] = preview
+
+    def _noter_echec(self, id_conv: str):
+        """Une tentative RÉELLE (lecture ou envoi) a échoué : on la compte."""
+        self._pending[id_conv] = self._pending.get(id_conv, 0) + 1
+        self._save_state()
+
+    def _trim_state(self, garde: int = 400, garde_ensembles: int = 3000):
+        """Borne la taille de la mémoire (LRU : on oublie les moins récents)."""
         if len(self._last_previews) > garde * 1.5:
             for k in list(self._last_previews)[:len(self._last_previews) - garde]:
                 del self._last_previews[k]
+        for ens in (self._settled, self._ignorees):
+            if len(ens) > garde_ensembles * 1.5:
+                for k in list(ens)[:len(ens) - garde_ensembles]:
+                    ens.discard(k)
 
     # ── Démarrage ────────────────────────────────────────────────────────────
 
@@ -423,9 +515,8 @@ class LeboncoinClient:
         self._shutdown = False
         self._is_cdp = False
         self._current_thread_url = None
-        self._pending.clear()
-        self._ignorees.clear()
-        self._settled.clear()
+        # (_pending / _ignorees / _settled sont persistés : on ne les vide pas,
+        # sinon une réponse en attente serait perdue ou doublée.)
         try:
             await self.start()
             self._echecs_redemarrage = 0
@@ -690,7 +781,7 @@ class LeboncoinClient:
             change = self._last_previews.get(href) != preview
 
             if id_conv in self._ignorees:
-                self._last_previews[href] = preview   # décision définitive
+                self._set_preview(href, preview)      # décision définitive
                 continue                              # on est l'acheteur ici
 
             if id_conv in self._pending:
@@ -701,9 +792,11 @@ class LeboncoinClient:
                     )
                     del self._pending[id_conv]
                     self._settled.add(id_conv)
-                    self._last_previews[href] = preview
+                    self._set_preview(href, preview)
                     continue
-                self._pending[id_conv] += 1
+                # Le compteur ne bouge PAS ici : il compte les échecs réels
+                # (voir _noter_echec), pas les scans ni les fils coupés par
+                # MAX_CONVS_PER_SCAN.
                 logger.debug(f"🔁 Conv {id_conv} : réponse en attente, nouvelle tentative")
                 todo.append(it)
             elif change:
@@ -712,7 +805,7 @@ class LeboncoinClient:
                 todo.append(it)
             else:
                 logger.debug(f"⏭️ Conv {id_conv} : rien de nouveau, fil non ouvert")
-                self._last_previews[href] = preview   # vu ET vérifié : rien à faire
+                self._set_preview(href, preview)      # vu ET vérifié : rien à faire
 
             # ⚠️ Pour les fils envoyés à l'inspection, l'aperçu n'est enregistré
             # qu'APRÈS l'inspection (get_new_messages). Sinon, un fil coupé par
@@ -791,12 +884,12 @@ class LeboncoinClient:
             # ⚠️ Cet enregistrement ne doit PAS avoir lieu avant l'ouverture :
             # un fil coupé par la limite de scan doit rester candidat au scan
             # suivant, sinon le message qu'il contient est perdu.
-            self._last_previews[href] = it["preview"]
+            self._set_preview(href, it["preview"])
 
             if thread is None:
-                # Fil illisible (captcha, lien absent…) : on retente au scan
-                # suivant — `_pending` borne le nombre d'essais.
-                self._pending.setdefault(id_conv, 0)
+                # Fil illisible (captcha, lien absent…) : échec RÉEL, compté ;
+                # on retente au scan suivant, `_pending` borne les essais.
+                self._noter_echec(id_conv)
                 continue
 
             # Conversation où NOUS sommes l'acheteur (« À propos de ce vendeur ») :
@@ -806,6 +899,7 @@ class LeboncoinClient:
                 logger.info(f"⏭️ Conv {id_conv} : nous sommes l'acheteur → ignorée pour de bon.")
                 self._ignorees.add(id_conv)
                 self._pending.pop(id_conv, None)
+                self._save_state()
                 continue
 
             # Pré-réponses proposées par leboncoin (facultatives) : on les trace.
@@ -828,6 +922,7 @@ class LeboncoinClient:
                 logger.debug(f"⏭️ Dernier message = nous, conv réglée ({id_conv})")
                 self._settled.add(id_conv)
                 self._pending.pop(id_conv, None)
+                self._save_state()
                 continue
 
             texte = thread.get("buyersText")
@@ -835,11 +930,14 @@ class LeboncoinClient:
                 logger.debug(f"⏭️ Fil sans message d'acheteur ({id_conv})")
                 self._settled.add(id_conv)
                 self._pending.pop(id_conv, None)
+                self._save_state()
                 continue
 
             # Réponse à produire : elle reste « en attente » jusqu'à ce que
             # l'envoi soit confirmé (send_message la retire de _pending).
+            # Compteur à 0 = aucun échec ; send_message/_noter_echec l'incrémente.
             self._pending.setdefault(id_conv, 0)
+            self._save_state()
 
             conversations.append({
                 "id_conv": id_conv,
@@ -897,8 +995,27 @@ class LeboncoinClient:
 
     # ── Envoi ────────────────────────────────────────────────────────────────
 
+    def _marquer_envoye(self, id_conv: str):
+        self._pending.pop(id_conv, None)
+        self._settled.add(id_conv)
+        self._save_state()
+
     async def send_message(self, id_conv: str, texte: str,
                            conv_url: str = None, buyer_text: str = None) -> bool:
+        """Envoie un message ; un échec est compté dans `_pending` (borné)."""
+        ok = await self._send_message_inner(id_conv, texte, conv_url, buyer_text)
+        if not ok:
+            self._noter_echec(id_conv)
+        return ok
+
+    async def _lire_fil_courant(self):
+        try:
+            return await self.page.evaluate(JS_THREAD)
+        except Exception:
+            return None
+
+    async def _send_message_inner(self, id_conv: str, texte: str,
+                                  conv_url: str = None, buyer_text: str = None) -> bool:
         """Tape et envoie un message dans la conversation."""
         target = conv_url or f"https://www.leboncoin.fr/messages/id/{id_conv}"
 
@@ -917,6 +1034,13 @@ class LeboncoinClient:
             ):
                 if not await self._open_thread(target):
                     return False
+
+            # Anti-doublon : une tentative précédente non confirmée est peut-être
+            # passée. Si la dernière bulle est déjà notre texte, on n'envoie pas.
+            if _fil_contient_envoi(await self._lire_fil_courant(), texte):
+                logger.info(f"Conv {id_conv} : message déjà présent dans le fil → pas de renvoi")
+                self._marquer_envoye(id_conv)
+                return True
 
             champ = await self.page.query_selector(TEXTAREA)
             if not champ:
@@ -980,9 +1104,18 @@ class LeboncoinClient:
             await H.pause(0.8, 1.5)
 
             sent = await self._verify_sent(texte, prev_count)
+            if not sent:
+                # Avant de conclure à l'échec (et donc de permettre un renvoi),
+                # on RELIT le fil : le message est peut-être bien parti.
+                try:
+                    await self._open_thread(target)
+                except Exception:
+                    pass
+                if _fil_contient_envoi(await self._lire_fil_courant(), texte):
+                    logger.info(f"Conv {id_conv} : envoi retrouvé à la relecture du fil")
+                    sent = True
             if sent:
-                self._pending.pop(id_conv, None)
-                self._settled.add(id_conv)
+                self._marquer_envoye(id_conv)
                 logger.info(f"Message envoyé ✅ conv {id_conv}")
             else:
                 logger.warning(f"⚠️ Conv {id_conv} : envoi non confirmé")
@@ -1018,20 +1151,19 @@ class LeboncoinClient:
         champ (le champ peut se vider alors que l'envoi a échoué, ce qui
         produirait un faux « envoyé » et perdrait le message).
         """
-        core = snippet.strip()[:40]
+        if not _norm_texte(snippet):
+            return False
         for _ in range(30):  # ~15 s
             try:
                 data = await self.page.evaluate(JS_THREAD)
             except Exception:
                 await asyncio.sleep(0.5)
                 continue
-            if data and data.get("lastSide") == "out":
-                lt = data.get("lastText") or ""
-                if not core or core in lt:
-                    return True
-                # bulle sortante mais texte différent : on accepte seulement si
-                # le nombre de bulles a réellement augmenté
-                if data.get("count", 0) > prev_count:
+            # Texte COMPLET normalisé (typographie, insécables), pas un préfixe ;
+            # et la bulle sortante doit être nouvelle (count a augmenté) ou, si le
+            # compteur est indisponible (prev_count == 0), simplement identique.
+            if _fil_contient_envoi(data, snippet):
+                if data.get("count", 0) > prev_count or prev_count == 0:
                     return True
             await asyncio.sleep(0.5)
         return False

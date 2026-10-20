@@ -190,6 +190,7 @@ async def process() -> bool:
                 if not reponse:
                     logger.warning(f"⏭️ Pas de réponse LLM pour conv {id_conv}")
                     stats["erreurs"] += 1
+                    lbc._noter_echec(id_conv)   # tentative ratée : bornée par MAX_TENTATIVES
                     continue
 
         logger.info(f"💬 Réponse: {reponse[:80]}...")
@@ -202,8 +203,13 @@ async def process() -> bool:
 
         # Sauvegarder user + assistant SEULEMENT après envoi réussi
         # (si l'envoi échoue, rien n'est sauvé → le prochain scan retente)
-        await db.save_message(id_conv, "user", texte)
-        await db.save_message(id_conv, "assistant", reponse)
+        # Une seule transaction : pas d'état à moitié écrit si le processus s'arrête.
+        if not await db.save_exchange(id_conv, texte, reponse):
+            logger.error(
+                f"❌ Réponse envoyée à conv {id_conv} mais NON enregistrée en base "
+                f"(risque de doublon au prochain scan)."
+            )
+            stats["erreurs"] += 1
         stats["messages_traites"] += 1
         traite = True
 
