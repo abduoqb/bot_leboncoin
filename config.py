@@ -18,8 +18,18 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 # ── LLM ──────────────────────────────────────────────────────────────────────
 # deepseek-v3.1:671b-cloud est un modèle CLOUD retiré → HTTP 410 Gone.
 # gemma3:4b est installé en local et gratuit (cf. README).
-OLLAMA_MODEL = "gemma3:4b"
-OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+# Timeouts (s) par appel : un chargement à froid du modèle peut dépasser 60 s.
+OLLAMA_TIMEOUT_CLASSIFY = 30
+OLLAMA_TIMEOUT_REPLY = 90
+# Reprises (erreur réseau, 5xx, timeout) : tentatives TOTALES, bornées.
+OLLAMA_MAX_ATTEMPTS_REPLY = 3
+OLLAMA_MAX_ATTEMPTS_CLASSIFY = 2
+OLLAMA_BACKOFF_BASE = 1.0   # s ; délai = base * 2^(essai-1) + jitter
+OLLAMA_BACKOFF_MAX = 8.0    # s ; plafond d'un délai
+# Garde le modèle en mémoire entre deux messages (évite les chargements à froid).
+OLLAMA_KEEP_ALIVE = "30m"
 
 # ── ANTI-BOT & DELAYS ───────────────────────────────────────────────────────
 # Cadence volontairement lente : chaque scan recharge la liste des messages.
@@ -61,6 +71,7 @@ CAPTCHA_WAIT_SECONDS = 300
 # fenêtre « about:blank » de plus.
 RESTART_COOLDOWN_SECONDS = 180
 MAX_RESTART_ESSAIS = 3         # au-delà, on attend le cooldown
+
 
 MAX_HISTORY = 8
 HEADLESS = False       # False = navigateur visible
