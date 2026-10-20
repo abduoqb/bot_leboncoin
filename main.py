@@ -15,6 +15,7 @@ from config import (
 from conversation import ConversationManager, fil_vers_historique
 import instance
 from horaire import en_pause_nocturne, prochain_reveil, valider_heures
+from boucle import delai_backoff, tirer_intervalle, executer_nettoyage
 from llm import generate_reply, classify_message, init_session, close_session
 from leboncoin import LeboncoinClient
 from rules import (
@@ -23,7 +24,7 @@ from rules import (
     valider_reponse, offre_chiffree, reponse_contre_offre,
 )
 
-# ── Logging (Bug 16: rotation 5Mo x 3 fichiers) ─────────
+# ── Logging (fichier à rotation : 5 Mo x 3 fichiers) ─────────
 # Windows : la console est en cp1252 et ferait planter tout log contenant un
 # emoji (UnicodeEncodeError → message perdu). On force UTF-8 sur les flux.
 try:
@@ -51,18 +52,35 @@ db = ConversationManager()
 lbc = LeboncoinClient()
 stats = {"messages_traites": 0, "erreurs": 0, "scans": 0}
 shutdown_event = asyncio.Event()
-idle_scans = 0            # Compteur de scans consécutifs sans nouveaux messages
 IDLE_SCAN_LIMIT = 10      # Nombre de scans vides avant pause repos
 IDLE_REST_SECONDS = 3600  # Durée de la pause repos (1h)
 
 
 async def process() -> bool:
-    """Scan les nouveaux messages et y répond. Retourne True si au moins 1 message traité."""
+    """Scan les nouveaux messages et y répond. Retourne True si au moins 1 message traité.
+
+    Le log de stats est dans un finally : une exception ne le saute pas.
+    """
+    scans_avant = stats["scans"]
+    try:
+        return await _scan_et_repondre()
+    finally:
+        if stats["scans"] != scans_avant and stats["scans"] % 5 == 0:
+            logger.info(
+                f"📊 Stats: {stats['messages_traites']} traités, "
+                f"{stats['erreurs']} erreurs, {stats['scans']} scans"
+            )
+
+
+async def _scan_et_repondre() -> bool:
     nouveaux = await lbc.get_new_messages()
     stats["scans"] += 1
     traite = False
 
     for i, msg in enumerate(nouveaux):
+        if shutdown_event.is_set():
+            logger.info("🛑 Arrêt demandé : on interrompt le traitement des conversations.")
+            break
         if i >= MAX_CONVS_PER_SCAN:
             logger.info(f"⏸️ Limite de {MAX_CONVS_PER_SCAN} convs/scan atteinte, les {len(nouveaux) - i} restantes attendront le prochain scan.")
             break
@@ -236,12 +254,6 @@ async def process() -> bool:
         stats["messages_traites"] += 1
         traite = True
 
-    if stats["scans"] % 5 == 0:
-        logger.info(
-            f"📊 Stats: {stats['messages_traites']} traités, "
-            f"{stats['erreurs']} erreurs, {stats['scans']} scans"
-        )
-
     return traite
 
 
@@ -260,7 +272,29 @@ async def main():
         )
         return
 
-    # Graceful shutdown
+    try:
+        await _run()
+    finally:
+        await _cleanup()
+
+
+async def _cleanup():
+    """Fermeture unique : chaque ressource dans son propre try/except."""
+    logger.info("🧹 Nettoyage en cours...")
+    await executer_nettoyage([
+        ("lbc.close", lbc.close),
+        ("close_session", close_session),
+        ("db.close", db.close),
+        ("instance.liberer", instance.liberer),
+    ])
+    logger.info(
+        f"👋 Bot arrêté. Bilan: {stats['messages_traites']} messages traités, "
+        f"{stats['erreurs']} erreurs, {stats['scans']} scans"
+    )
+
+
+async def _run():
+    # Arrêt propre sur Ctrl+C / SIGTERM
     loop = asyncio.get_running_loop()
 
     def _signal_handler():
@@ -271,20 +305,19 @@ async def main():
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            signal.signal(sig, lambda s, f: _signal_handler())
+            # Windows : le handler s'exécute hors de la boucle → on y revient
+            # de façon thread-safe (Event.set n'est pas thread-safe).
+            signal.signal(
+                sig, lambda s, f: loop.call_soon_threadsafe(_signal_handler))
 
     # Démarrage
-    await init_session()  # Session HTTP partagée (Bug 4)
+    await init_session()  # Session HTTP partagée
     await lbc.start()
 
     # Vérifie la connexion. Si un login ou un captcha est requis, on met le bot
     # en pause en attendant l'intervention humaine (jamais de résolution auto).
     if not await lbc.ensure_ready():
         logger.error("❌ Session non connectée après attente. Arrêt du bot.")
-        await lbc.close()
-        await close_session()
-        await db.close()
-        instance.liberer()
         return
 
     # ── Mode contrôlé : un seul scan puis arrêt (utile pour tester) ──
@@ -294,17 +327,16 @@ async def main():
             await process()
         except Exception as e:
             logger.error(f"❌ Erreur scan unique: {e}", exc_info=True)
-        await lbc.close()
-        await close_session()
-        await db.close()
-        instance.liberer()
         logger.info("🧹 Mode --once terminé.")
         return
 
     logger.info(f"🚀 Bot démarré — comportement humain activé (attente aléatoire + pause nocturne {NIGHT_START_HOUR}h-{NIGHT_END_HOUR}h)")
 
+    idle_scans = 0        # scans réellement exécutés ET vides, consécutifs
+    erreurs_consecutives = 0
+
     while not shutdown_event.is_set():
-        # ── Check nocturne AVANT le scan (Bug 1) ──
+        # ── Pause nocturne vérifiée AVANT le scan ──
         now = datetime.now()
         if en_pause_nocturne(now, NIGHT_START_HOUR, NIGHT_END_HOUR):
             reveil = prochain_reveil(now, NIGHT_END_HOUR)
@@ -316,49 +348,51 @@ async def main():
                 pass
             continue  # re-check l'heure au réveil
 
+        scan_vide = False   # True seulement si un scan a vraiment tourné et trouvé 0 message
+        en_erreur = False
         try:
             if not await lbc.ensure_alive():
                 logger.error("❌ Navigateur indisponible, nouvelle tentative au prochain cycle.")
-                had_messages = False
+                en_erreur = True
             else:
-                had_messages = await process()
+                scan_vide = not await process()
         except Exception as e:
             logger.error(f"❌ Erreur boucle principale: {e}", exc_info=True)
             stats["erreurs"] += 1
-            had_messages = False
+            en_erreur = True
 
-        # ── Système de repos (idle) ──
-        global idle_scans
-        if had_messages:
-            idle_scans = 0
+        if en_erreur:
+            erreurs_consecutives += 1
         else:
-            idle_scans += 1
-            if idle_scans >= IDLE_SCAN_LIMIT:
-                logger.info(f"💤 {IDLE_SCAN_LIMIT} scans consécutifs sans message. Pause repos de {IDLE_REST_SECONDS // 60} min...")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=IDLE_REST_SECONDS)
-                except asyncio.TimeoutError:
-                    pass
+            erreurs_consecutives = 0
+
+        # ── Système de repos (idle) : seuls les scans vides comptent ──
+        if not en_erreur:
+            if scan_vide:
+                idle_scans += 1
+                if idle_scans >= IDLE_SCAN_LIMIT:
+                    logger.info(f"💤 {IDLE_SCAN_LIMIT} scans consécutifs sans message. Pause repos de {IDLE_REST_SECONDS // 60} min...")
+                    await _attendre(IDLE_REST_SECONDS)
+                    idle_scans = 0
+                    continue
+            else:
                 idle_scans = 0
-                continue
 
-        try:
-            duree_sec = random.randint(SCAN_MIN, SCAN_MAX)
+        if en_erreur:
+            duree_sec = delai_backoff(erreurs_consecutives, SCAN_MAX)
+            logger.warning(f"⏳ {erreurs_consecutives} erreur(s) consécutive(s) : attente de {int(duree_sec)}s.")
+        else:
+            duree_sec = tirer_intervalle(SCAN_MIN, SCAN_MAX)
             logger.debug(f"Attente aléatoire de {duree_sec}s avant le prochain scan")
-            await asyncio.wait_for(shutdown_event.wait(), timeout=duree_sec)
-        except asyncio.TimeoutError:
-            pass
+        await _attendre(duree_sec)
 
-    # Cleanup
-    logger.info("🧹 Nettoyage en cours...")
-    await lbc.close()
-    await close_session()  # Fermer la session HTTP (Bug 4)
-    await db.close()
-    instance.liberer()
-    logger.info(
-        f"👋 Bot arrêté. Bilan: {stats['messages_traites']} messages traités, "
-        f"{stats['erreurs']} erreurs, {stats['scans']} scans"
-    )
+
+async def _attendre(secondes):
+    """Attend `secondes` ou jusqu'à l'arrêt demandé (interruptible)."""
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=secondes)
+    except asyncio.TimeoutError:
+        pass
 
 
 if __name__ == "__main__":
