@@ -20,6 +20,7 @@ from leboncoin import LeboncoinClient
 from rules import (
     is_closing, is_manipulation, is_disponibilite, reponse_disponibilite,
     corrige_offre, ligne_decision_offre, REPONSE_CLOSING, sanitize_reply,
+    valider_reponse, offre_chiffree, reponse_contre_offre,
 )
 
 # ── Logging (Bug 16: rotation 5Mo x 3 fichiers) ─────────
@@ -92,6 +93,7 @@ async def process() -> bool:
         #    presque toujours une relance commerciale, on répond en dur.
         # 3) Disponibilité de l'article : donnée vérifiée, le modèle l'a déjà
         #    contredite (« Non, elle n'est plus disponible »). Réponse en dur.
+        categorie = None
         if is_manipulation(texte):
             reponse = REPONSES_STATIQUES["manipulation"]
             logger.info("🛡️ Injection de prompt détectée → réponse figée (0 appel LLM).")
@@ -183,7 +185,10 @@ async def process() -> bool:
                 if not reponse:
                     qr = msg.get("quick_replies") or []
                     if qr:
-                        reponse = qr[0]
+                        reponse = sanitize_reply(
+                            qr[0], has_history=nb_envois > 0,
+                            noms=NOMS_A_NEUTRALISER,
+                        )
                         logger.info(
                             f"💡 Repli sur la pré-réponse leboncoin : {reponse[:70]}…")
 
@@ -192,6 +197,24 @@ async def process() -> bool:
                     stats["erreurs"] += 1
                     lbc._noter_echec(id_conv)   # tentative ratée : bornée par MAX_TENTATIVES
                     continue
+
+        # ── Validation finale (toutes sources) : plancher, fragments d'instructions,
+        # URL/téléphone, longueur. En cas de rejet : réponse statique sûre.
+        decision = offre_chiffree(texte, VENTE)
+        acceptee = decision[0] if decision and decision[1] == decision[0] else None
+        ok, raison = valider_reponse(reponse, VENTE, offre_acceptee=acceptee)
+        if not ok:
+            logger.warning(f"🚫 Réponse rejetée pour conv {id_conv} ({raison}) : {reponse[:70]}…")
+            if categorie == "negociation":
+                sure = reponse_contre_offre(VENTE)
+            else:
+                sure = REPONSES_STATIQUES.get("manipulation")
+            if sure and valider_reponse(sure, VENTE, offre_acceptee=acceptee)[0]:
+                reponse = sure
+            else:
+                stats["erreurs"] += 1
+                lbc._noter_echec(id_conv)
+                continue
 
         logger.info(f"💬 Réponse: {reponse[:80]}...")
 

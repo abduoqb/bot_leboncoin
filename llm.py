@@ -1,12 +1,42 @@
 import logging
 import asyncio
+import re
 import aiohttp
-from config import OLLAMA_URL, OLLAMA_MODEL
+from config import OLLAMA_URL, OLLAMA_MODEL, PROMPT_ROUTER
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # secondes entre les tentatives
+
+# Catégories du routeur : définies UNE fois ici (importées ailleurs).
+CATEGORIES = ("negociation", "produit", "rdv", "manipulation", "hors_sujet", "general")
+
+# Le texte acheteur est une donnée non fiable : tronqué et encadré par des balises.
+MAX_TEXTE_ACHETEUR = 500
+_BALISE_RE = re.compile(r"<\s*/?\s*message_acheteur\s*>", re.IGNORECASE)
+
+
+def encadrer_message_acheteur(texte: str) -> str:
+    """Tronque le texte acheteur, neutralise ses balises, l'encadre une seule fois."""
+    t = _BALISE_RE.sub(" ", texte or "").strip()
+    if len(t) > MAX_TEXTE_ACHETEUR:
+        t = t[:MAX_TEXTE_ACHETEUR].rstrip() + "…"
+    return f"<message_acheteur>{t}</message_acheteur>"
+
+
+def _normaliser_categorie(brut: str) -> str:
+    """Premier mot du modèle == catégorie exacte ; sous-chaîne en repli (loguée)."""
+    mots = re.findall(r"[a-z_]+", (brut or "").lower())
+    if mots and mots[0] in CATEGORIES:
+        return mots[0]
+    for valid in CATEGORIES:
+        if valid in (brut or "").lower():
+            logger.warning(f"Classification approximative '{brut[:40]}' -> [{valid}] (repli sous-chaîne)")
+            return valid
+    logger.warning(f"Classification inconnue '{(brut or '')[:40]}', fallback sur 'general'")
+    return "general"
+
 
 # ── Session HTTP partagée (Bug 4) ────────────────────────
 _session: aiohttp.ClientSession | None = None
@@ -38,17 +68,16 @@ async def _get_session() -> aiohttp.ClientSession:
 
 async def classify_message(texte: str) -> str:
     """Demande à Ollama de catégoriser le message (negociation, produit, rdv, manipulation, hors_sujet, general)."""
-    from config import PROMPT_ROUTER
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
             {"role": "system", "content": PROMPT_ROUTER},
-            {"role": "user", "content": texte}
+            {"role": "user", "content": encadrer_message_acheteur(texte)}
         ],
         "stream": False,
         "options": {
             "temperature": 0.0,
-            "num_predict": 10
+            "num_predict": 16
         }
     }
     
@@ -58,16 +87,9 @@ async def classify_message(texte: str) -> str:
         async with session.post(OLLAMA_URL, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
             r.raise_for_status()
             data = await r.json()
-            cat = data["message"]["content"].strip().lower()
-            
-            # Nettoyer la réponse au cas où
-            for valid in ["negociation", "produit", "rdv", "manipulation", "hors_sujet", "general"]:
-                if valid in cat:
-                    logger.info(f"Catégorie détectée: [{valid}]")
-                    return valid
-                    
-            logger.warning(f"Classification inconnue '{cat}', fallback sur 'general'")
-            return "general"
+            cat = _normaliser_categorie(data["message"]["content"])
+            logger.info(f"Catégorie détectée: [{cat}]")
+            return cat
     except Exception as e:
         logger.error(f"Erreur classification LLM: {e}")
         return "general"
@@ -76,6 +98,12 @@ async def classify_message(texte: str) -> str:
 
 async def generate_reply(messages: list) -> str | None:
     """Envoie les messages à Ollama et retourne la réponse. Retry 3x en cas d'erreur."""
+    # Les messages acheteur (role user) sont tronqués et balisés ; copie, sans muter l'appelant.
+    messages = [
+        {**m, "content": encadrer_message_acheteur(m.get("content", ""))}
+        if m.get("role") == "user" else m
+        for m in messages
+    ]
     payload = {
         "model": OLLAMA_MODEL,
         "messages": messages,

@@ -77,14 +77,27 @@ def is_closing(text: str, max_rest: int = 4) -> bool:
 
 _MANIP_PATTERNS = [
     r"ignore[rs]?\s+(toutes?\s+)?(tes|les|mes)\s+(r[eè]gles|instructions|consignes)",
-    r"oublie[rs]?\s+(toutes?\s+)?(tes|les|mes)\s+(r[eè]gles|instructions|consignes)",
+    r"oublie[rs]?\s+(toutes?\s+)?(tes|les|mes|vos)\s+(r[eè]gles|instructions|consignes)",
     r"(affiche|montre|donne|r[eé]v[eè]le|envoie)[^.!?]{0,40}"
     r"(ton|le|tes)\s+(prompt|systeme|système|instructions|consignes|r[eè]gles internes)",
     r"(quel|quels)\s+(est|sont)\s+(ton|tes)\s+(prompt|instructions|consignes)",
-    r"tu es\s+(maintenant|d[eé]sormais|à partir de maintenant)",
-    r"(jailbreak|developer mode|dan mode|mode d[eé]veloppeur)",
+    r"tu es\s+(maintenant|d[eé]sormais|a partir de maintenant|à partir de maintenant)",
+    r"(jailbreak|developer mode|dan mode|mode d[eé]veloppeur|mode dieu|god mode)",
+    r"\bdan\b[^.!?]{0,20}\b(mode|prompt|jailbreak)\b|\byou\s+are\s+dan\b|\bdo\s+anything\s+now\b",
     r"r[eé]p[eè]te[^.!?]{0,30}(ton prompt|tes instructions|le texte ci-dessus)",
     r"agis comme\s+(si tu [eé]tais|un autre)",
+    # anglais
+    r"(ignore|disregard|forget|override|bypass)\s+(all\s+|any\s+|the\s+|your\s+|my\s+)*"
+    r"(previous|prior|above|earlier|former|system)?\s*(instructions?|rules|prompts?|guidelines|directives)",
+    r"(reveal|show|print|display|repeat|leak|tell\s+me)[^.!?]{0,30}"
+    r"(your|the)\s+(system\s+)?(prompt|instructions?|rules|guidelines)",
+    r"system\s*prompt|prompt\s+syst[eè]me|initial\s+prompt|prompt\s+initial",
+    r"you\s+are\s+now\b|from\s+now\s+on\s+you|act\s+as\s+(if\s+you|an?\s+(?!buyer))|pretend\s+(to\s+be|you)",
+    r"what\s+(is|are)\s+your\s+(system\s+)?(prompt|instructions|rules)",
+    # variantes sans accents / formulations voisines
+    r"(prix|montant)\s+plancher|plancher\s+(du\s+)?(prix|vendeur)|prix\s+minimum\s+(r[eé]el|du\s+vendeur)",
+    r"(ignore|oublie|oubliez|ignorez)\s+(tout|tout\s+ce)\s+(ce\s+)?(qui\s+(pr[eé]c[eè]de|a\s+[eé]t[eé]\s+dit)|ci-dessus)",
+    r"(nouvelles?|new)\s+(instructions?|consignes?|rules?)\s*:",
 ]
 
 
@@ -504,3 +517,63 @@ def sanitize_reply(text: str, has_history: bool = False, noms=None) -> str:
 
     t = t.strip()
     return t[0].upper() + t[1:]
+
+
+# ── 6. Validation finale d'une réponse AVANT envoi ───────────────────────────
+#
+# Dernier filet de sécurité, valable pour toutes les sources de réponse (LLM,
+# pré-réponse Leboncoin, règles figées) : ni fuite du prix plancher, ni
+# fragments des instructions internes, ni URL / téléphone / e-mail, ni pavé.
+
+MAX_LONGUEUR_REPONSE = 600
+
+_FRAGMENTS_INTERDITS_RE = re.compile(
+    r"\[\s*(?:d[eé]cision|info)\s+interne|d[eé]cision\s+interne|info\s+interne"
+    r"|plancher|base_persona|message_acheteur|system\s*prompt|prompt\s+syst[eè]me"
+    r"|prix_(?:plancher|contre_offre|affiche)|contre_offre_eur"
+    r"|\b(?:mes|tes|ces|les|mon|my|your|internal|internes?)\s+(?:instructions|consignes)\b"
+    r"|\binstructions\s+(?:internes?|syst[eè]me|initiales)\b",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(
+    r"https?://|\bwww\.|\b[\w-]+\.(?:com|fr|net|org|io|me|ly|app|xyz|link|ru|cc)\b",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_TEL_LARGE_RE = re.compile(r"(?<!\d)\+\d[\d\s.\-]{7,}\d|(?<!\d)\d{10}(?!\d)")
+
+
+def valider_reponse(reponse, vente: dict, offre_acceptee=None) -> tuple:
+    """(ok, raison) : la réponse peut-elle partir telle quelle chez l'acheteur ?
+
+    Rejette : fuite du prix plancher (« 400 », « 400€ », « 400,00 »…) sauf si
+    c'est le montant d'une acceptation légitime (offre_acceptee) ; fragments
+    d'instructions internes ; URL, e-mail, téléphone ; réponse trop longue.
+    Le prix affiché et les contre-offres au-dessus du plancher restent permis.
+    """
+    if not reponse or not str(reponse).strip():
+        return False, "réponse vide"
+    texte = str(reponse)
+    if len(texte) > MAX_LONGUEUR_REPONSE:
+        return False, f"réponse trop longue ({len(texte)} > {MAX_LONGUEUR_REPONSE})"
+    m = _FRAGMENTS_INTERDITS_RE.search(texte)
+    if m:
+        return False, f"fragment d'instructions internes : « {m.group(0)} »"
+    if _URL_RE.search(texte):
+        return False, "URL dans la réponse"
+    if _EMAIL_RE.search(texte):
+        return False, "adresse e-mail dans la réponse"
+    if _TEL_RE.search(texte) or _TEL_LARGE_RE.search(texte):
+        return False, "numéro de téléphone dans la réponse"
+
+    plancher = (vente or {}).get("prix_plancher_eur")
+    if isinstance(plancher, (int, float)) and plancher:
+        affiche = vente.get("prix_affiche_eur")
+        legitime = (isinstance(offre_acceptee, (int, float))
+                    and float(offre_acceptee) == float(plancher))
+        # Plancher == prix affiché (non négociable) : ce n'est pas un secret.
+        if not legitime and affiche != plancher:
+            _, trouves = _extraire(texte, plancher, plancher)
+            if trouves:
+                return False, f"fuite possible du prix plancher ({_fmt(plancher)})"
+    return True, ""
