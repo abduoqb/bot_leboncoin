@@ -15,6 +15,7 @@ class FakeLbc:
         self.send_ok = send_ok
         self.envoyes = []
         self.echecs = []
+        self.regles = []
 
     async def get_new_messages(self):
         return self.messages
@@ -26,13 +27,17 @@ class FakeLbc:
     def _noter_echec(self, id_conv):
         self.echecs.append(id_conv)
 
+    def _regler(self, id_conv):
+        self.regles.append(id_conv)
+
 
 class FakeDb:
     def __init__(self):
         self.saves = []
+        self.existants = []
 
     async def get_messages(self, id_conv):
-        return [], 0
+        return self.existants, len(self.existants) // 2
 
     async def build_context(self, id_conv, texte, persona, max_hist, fil=None):
         return [{"role": "system", "content": persona},
@@ -164,3 +169,16 @@ def test_heartbeat_atomique(tmp_path):
     assert not (tmp_path / "hb.json.tmp").exists()
     # chemin inexistant : ignoré
     assert ecrire_heartbeat(str(tmp_path / "x" / "hb.json"), {}, "ok") is False
+
+
+def test_deja_repondu_regle_le_fil_sans_reponse(env):
+    """Même texte déjà suivi d'une réponse : pas de réponse, et le fil est réglé
+    (sinon il serait rouvert à chaque scan)."""
+    installer, appels, stats = env
+    lbc, db = installer([msg("Bonjour")])
+    db.existants = [{"role": "user", "content": "Bonjour"},
+                    {"role": "assistant", "content": "Bonjour, oui."}]
+    asyncio.run(main.process())
+    assert lbc.envoyes == []
+    assert lbc.regles == ["c1"]
+    assert appels["classify"] == 0 and appels["generate"] == 0

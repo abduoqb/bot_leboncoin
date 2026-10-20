@@ -240,6 +240,7 @@ async def _traiter_conversation(msg) -> bool:
     # Skip SEULEMENT si : même texte ET on a déjà répondu (assistant après user)
     if _deja_repondu(existing_msgs, texte):
         logger.info(f"⏭️ Déjà répondu à ce message, skip conv {id_conv}")
+        lbc._regler(id_conv)   # sinon le fil serait rouvert à chaque scan
         return False
 
     reponse, categorie = await _choisir_reponse(msg, id_conv, texte)

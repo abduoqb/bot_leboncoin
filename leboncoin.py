@@ -190,6 +190,16 @@ class LeboncoinClient:
         self._pending[id_conv] = self._pending.get(id_conv, 0) + 1
         self._save_state()
 
+    def _regler(self, id_conv: str):
+        """Fil sans réponse à envoyer (ex. message déjà traité) : on le règle.
+
+        Sans cela, `_pending` resterait à 0 et le fil serait rouvert à chaque
+        scan (signal anti-bot, et il consomme le budget de fils inspectés).
+        """
+        self._pending.pop(id_conv, None)
+        self._settled.add(id_conv)
+        self._save_state()
+
     def _trim_state(self, garde: int = 400, garde_ensembles: int = 3000):
         """Borne la taille de la mémoire (LRU : on oublie les moins récents)."""
         if len(self._last_previews) > garde * 1.5:
